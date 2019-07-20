@@ -4,7 +4,7 @@ COMPONENT_OWNCLEANTARGET := true
 
 COMPONENT_ADD_INCLUDEDIRS := 
 
-CPPFLAGS += -std=gnu++11
+CPPFLAGS += -std=gnu++11 -fno-rtti
 
 build: 
 	mkdir -p $(COMPONENT_PATH)/build
