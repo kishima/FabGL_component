@@ -40,8 +40,9 @@
 
 #include "fabglconf.h"
 #include "fabutils.h"
-#include "vgacontroller.h"
+#include "displaycontroller.h"
 #include "canvas.h"
+#include "fabfonts.h"
 
 
 
@@ -60,7 +61,9 @@
           *uiTextEdit
           *uiScrollableControl
             *uiPaintBox
-            *uiListBox
+              *uiCustomListBox
+                *uiListBox
+                *uiFileBrowser
             uiMemoEdit
           *uiCheckBox
           *uiComboBox
@@ -77,7 +80,7 @@ namespace fabgl {
 
 
 // increase in case of garbage between windows!
-#define FABGLIB_UI_EVENTS_QUEUE_SIZE 128
+#define FABGLIB_UI_EVENTS_QUEUE_SIZE 256
 
 
 
@@ -103,7 +106,7 @@ enum uiEventID {
   UIEVT_MOUSELEAVE,
   UIEVT_MAXIMIZE,   // Request for maximize
   UIEVT_MINIMIZE,   // Request for minimize
-  UIEVT_RESTORE,    // restore from UIEVT_MAXIMIZE or UIEVT_MINIMIZE
+  UIEVT_RESTORE,    // Restore from UIEVT_MAXIMIZE or UIEVT_MINIMIZE
   UIEVT_SHOW,
   UIEVT_HIDE,
   UIEVT_SETFOCUS,
@@ -116,6 +119,7 @@ enum uiEventID {
   UIEVT_EXITMODAL,
   UIEVT_DESTROY,
   UIEVT_CLOSE,      // Request to close (frame Close button)
+  UIEVT_QUIT,       // Quit the application
 };
 
 
@@ -170,6 +174,8 @@ struct uiEvent {
     uiWindow * oldFocused;
     // event: UIEVT_KILLFOCUS
     uiWindow * newFocused;
+    // event: UIEVT_QUIT
+    int exitCode;
 
     uiEventParams() { }
   } params;
@@ -209,13 +215,15 @@ struct uiObjectType {
   uint32_t uiImage             : 1;
   uint32_t uiPanel             : 1;
   uint32_t uiPaintBox          : 1;
+  uint32_t uiCustomListBox     : 1;
   uint32_t uiListBox           : 1;
+  uint32_t uiFileBrowser       : 1;
   uint32_t uiComboBox          : 1;
   uint32_t uiCheckBox          : 1;
   uint32_t uiSlider            : 1;
 
   uiObjectType() : uiApp(0), uiEvtHandler(0), uiWindow(0), uiFrame(0), uiControl(0), uiScrollableControl(0), uiButton(0), uiTextEdit(0),
-                   uiLabel(0), uiImage(0), uiPanel(0), uiPaintBox(0), uiListBox(0), uiComboBox(0), uiCheckBox(0), uiSlider(0)
+                   uiLabel(0), uiImage(0), uiPanel(0), uiPaintBox(0), uiCustomListBox(0), uiListBox(0), uiFileBrowser(0), uiComboBox(0), uiCheckBox(0), uiSlider(0)
     { }
 };
 
@@ -313,12 +321,12 @@ struct uiWindowProps {
 
 /** @brief Contains the window style */
 struct uiWindowStyle {
-  CursorName       defaultCursor      = CursorName::CursorPointerSimpleReduced;  /**< Default window mouse cursor */
-  RGB              borderColor        = RGB(2, 2, 2);                            /**< Border color */
-  RGB              activeBorderColor  = RGB(2, 2, 3);                            /**< Border color when active */
-  RGB              focusedBorderColor = RGB(0, 0, 3);                            /**< Border color when focused */
-  uint8_t          borderSize         = 3;                                       /**< Border size in pixels. This determines also the resize grips area. */
-  uint8_t          focusedBorderSize  = 1;                                       /**< Border size when focused */
+  CursorName    defaultCursor      = CursorName::CursorPointerSimpleReduced;  /**< Default window mouse cursor */
+  RGB888        borderColor        = RGB888(128, 128, 128);                         /**< Border color */
+  RGB888        activeBorderColor  = RGB888(128, 128, 255);                         /**< Border color when active */
+  RGB888        focusedBorderColor = RGB888(0, 0, 255);                         /**< Border color when focused */
+  uint8_t       borderSize         = 3;                                       /**< Border size in pixels. This determines also the resize grips area. */
+  uint8_t       focusedBorderSize  = 1;                                       /**< Border size when focused */
 };
 
 
@@ -353,6 +361,8 @@ public:
   virtual ~uiWindow();
 
   virtual void processEvent(uiEvent * event);
+
+  void setCanvas(Canvas * canvas) { m_canvas = canvas; }
 
   /**
    * @brief Gets next sibling
@@ -566,6 +576,8 @@ public:
    */
   int focusIndex() { return m_focusIndex; }
 
+  Canvas * canvas() { return m_canvas; }
+  
 
   // Delegates
 
@@ -577,7 +589,7 @@ public:
   Delegate<> onClick;
 
   /**
-   * @brief Mouse double click event delegate4
+   * @brief Mouse double click event delegate
    *
    * This delegate is called when the mouse button is double pressed and released on the same position.
    * To change double click time use uiAppProps.doubleClickTime of uiApp.appProps().
@@ -614,6 +626,8 @@ private:
 
 
   uiWindow *    m_parent;
+
+  Canvas *      m_canvas;
 
   Point         m_pos;
   Size          m_size;
@@ -655,16 +669,16 @@ private:
  * Specifies frame style (colors, title font, etc...)
  */
 struct uiFrameStyle {
-  RGB              backgroundColor                = RGB(3, 3, 3);  /**< Frame background color */
-  RGB              titleBackgroundColor           = RGB(2, 2, 2);  /**< Title background color */
-  RGB              activeTitleBackgroundColor     = RGB(2, 2, 3);  /**< Title background color when active */
-  RGB              titleColor                     = RGB(0, 0, 0);  /**< Title color */
-  RGB              activeTitleColor               = RGB(0, 0, 0);  /**< Title color when active */
-  FontInfo const * titleFont                      = Canvas.getPresetFontInfoFromHeight(12, false);  /**< Title font */
-  RGB              buttonColor                    = RGB(1, 1, 1);  /**< Color used to draw Close, Maximize and Minimize buttons */
-  RGB              activeButtonColor              = RGB(0, 0, 0);  /**< Color used to draw Close, Maximize and Minimize buttons */
-  RGB              mouseOverBackgroundButtonColor = RGB(0, 0, 3);  /**< Color used for background of Close, Maximize and Minimize buttons when mouse is over them */
-  RGB              mouseOverButtonColor           = RGB(3, 3, 3);  /**< Color used for pen of Close, Maximize and Minimize buttons when mouse is over them */
+  RGB888              backgroundColor                = RGB888(255, 255, 255);  /**< Frame background color */
+  RGB888              titleBackgroundColor           = RGB888(128, 128, 128);  /**< Title background color */
+  RGB888              activeTitleBackgroundColor     = RGB888(128, 128, 255);  /**< Title background color when active */
+  RGB888              titleColor                     = RGB888(0, 0, 0);  /**< Title color */
+  RGB888              activeTitleColor               = RGB888(0, 0, 0);  /**< Title color when active */
+  FontInfo const *    titleFont                      = &FONT_std_12;  /**< Title font */
+  RGB888              buttonColor                    = RGB888(64, 64, 64);  /**< Color used to draw Close, Maximize and Minimize buttons */
+  RGB888              activeButtonColor              = RGB888(0, 0, 0);  /**< Color used to draw Close, Maximize and Minimize buttons */
+  RGB888              mouseOverBackgroundButtonColor = RGB888(0, 0, 255);  /**< Color used for background of Close, Maximize and Minimize buttons when mouse is over them */
+  RGB888              mouseOverButtonColor           = RGB888(255, 255, 255);  /**< Color used for pen of Close, Maximize and Minimize buttons when mouse is over them */
 };
 
 
@@ -800,6 +814,21 @@ public:
    */
   Delegate<uiTimerHandle> onTimer;
 
+  /**
+   * @brief Key-down event delegate
+   */
+  Delegate<uiKeyEventInfo> onKeyDown;
+
+  /**
+   * @brief Key-up event delegate
+   */
+  Delegate<uiKeyEventInfo> onKeyUp;
+
+  /**
+   * @brief Paint event delegate
+   */
+  Delegate<> onPaint;
+
 
 protected:
 
@@ -873,10 +902,10 @@ public:
 
 /** @brief Contains the scrollable control style */
 struct uiScrollableControlStyle {
-  RGB scrollBarBackgroundColor          = RGB(1, 1, 1);  /**< Background color of the scrollbar */
-  RGB scrollBarForegroundColor          = RGB(2, 2, 2);  /**< Foreground color of the scrollbar */
-  RGB mouseOverScrollBarForegroundColor = RGB(3, 3, 3);  /**< Foreground color of the scrollbar when mouse is over it */
-  uint8_t scrollBarSize                 = 11;            /**< Width of vertical scrollbar, height of vertical scroll bar */
+  RGB888  scrollBarBackgroundColor          = RGB888(64, 64, 64);  /**< Background color of the scrollbar */
+  RGB888  scrollBarForegroundColor          = RGB888(128, 128, 128);  /**< Foreground color of the scrollbar */
+  RGB888  mouseOverScrollBarForegroundColor = RGB888(255, 255, 255);  /**< Foreground color of the scrollbar when mouse is over it */
+  uint8_t scrollBarSize                     = 11;            /**< Width of vertical scrollbar, height of vertical scroll bar */
 };
 
 
@@ -1054,15 +1083,15 @@ private:
 
 /** @brief Contains the button style */
 struct uiButtonStyle {
-  RGB              backgroundColor          = RGB(2, 2, 2); /**< Background color */
-  RGB              downBackgroundColor      = RGB(2, 2, 3); /**< Background color when button is down */
-  RGB              mouseOverBackgroundColor = RGB(2, 2, 3); /**< Background color when mouse is over */
-  RGB              mouseDownBackgroundColor = RGB(3, 3, 3); /**< Background color when mouse is down */
-  RGB              textColor                = RGB(0, 0, 0); /**< Text color */
-  FontInfo const * textFont                 = Canvas.getPresetFontInfoFromHeight(14, false); /**< Text font */
-  uint8_t          bitmapTextSpace          = 4;            /**< Spaces between image and text */
-  Bitmap const *   bitmap                   = nullptr;      /**< Bitmap to display */
-  Bitmap const *   downBitmap               = nullptr;      /**< Bitmap to display when button is down */
+  RGB888           backgroundColor          = RGB888(128, 128, 128); /**< Background color */
+  RGB888           downBackgroundColor      = RGB888(128, 128, 255); /**< Background color when button is down */
+  RGB888           mouseOverBackgroundColor = RGB888(128, 128, 255); /**< Background color when mouse is over */
+  RGB888           mouseDownBackgroundColor = RGB888(255, 255, 255); /**< Background color when mouse is down */
+  RGB888           textColor                = RGB888(0, 0, 0);       /**< Text color */
+  FontInfo const * textFont                 = &FONT_std_14;          /**< Text font */
+  uint8_t          bitmapTextSpace          = 4;                     /**< Spaces between image and text */
+  Bitmap const *   bitmap                   = nullptr;               /**< Bitmap to display */
+  Bitmap const *   downBitmap               = nullptr;               /**< Bitmap to display when button is down */
 };
 
 
@@ -1180,11 +1209,11 @@ private:
  * @return L-value representing frame style (colors, font, etc...)
  */
 struct uiTextEditStyle {
-  RGB              backgroundColor            = RGB(2, 2, 2);                                   /**< Background color */
-  RGB              mouseOverBackgroundColor   = RGB(2, 2, 3);                                   /**< Background color when mouse is over */
-  RGB              focusedBackgroundColor     = RGB(3, 3, 3);                                   /**< Background color when focused */
-  RGB              textColor                  = RGB(0, 0, 0);                                   /**< Text color */
-  FontInfo const * textFont                   = Canvas.getPresetFontInfoFromHeight(14, false);  /**< Text font */
+  RGB888           backgroundColor            = RGB888(128, 128, 128);     /**< Background color */
+  RGB888           mouseOverBackgroundColor   = RGB888(128, 128, 255);     /**< Background color when mouse is over */
+  RGB888           focusedBackgroundColor     = RGB888(255, 255, 255);     /**< Background color when focused */
+  RGB888           textColor                  = RGB888(0, 0, 0);           /**< Text color */
+  FontInfo const * textFont                   = &FONT_std_14;              /**< Text font */
 };
 
 
@@ -1318,9 +1347,9 @@ private:
 
 /** @brief Contains the label style */
 struct uiLabelStyle {
-  FontInfo const * textFont                 = Canvas.getPresetFontInfoFromHeight(14, false);  /**< Text font */
-  RGB              backgroundColor          = RGB(3, 3, 3);                                   /**< Background color */
-  RGB              textColor                = RGB(0, 0, 0);                                   /**< Text color */
+  FontInfo const * textFont                 = &FONT_std_14;              /**< Text font */
+  RGB888           backgroundColor          = RGB888(255, 255, 255);     /**< Background color */
+  RGB888           textColor                = RGB888(0, 0, 0);           /**< Text color */
 };
 
 
@@ -1407,7 +1436,7 @@ private:
 
 /** @brief Contains the image style */
 struct uiImageStyle {
-  RGB backgroundColor = RGB(3, 3, 3);   /**< Background color */
+  RGB888 backgroundColor = RGB888(255, 255, 255);   /**< Background color */
 };
 
 
@@ -1476,7 +1505,7 @@ private:
 
 /** @brief Contains the panel style */
 struct uiPanelStyle {
-  RGB backgroundColor = RGB(2, 2, 2);    /**< Panel background color */
+  RGB888 backgroundColor = RGB888(128, 128, 128);    /**< Panel background color */
 };
 
 
@@ -1523,7 +1552,7 @@ private:
 
 /** @brief Contains the paintbox style */
 struct uiPaintBoxStyle {
-  RGB backgroundColor = RGB(2, 2, 2);   /**< Paintbox background color */
+  RGB888 backgroundColor = RGB888(128, 128, 128);   /**< Paintbox background color */
 };
 
 
@@ -1576,24 +1605,24 @@ private:
 
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-// uiListBox
+// uiCustomListBox
 
 
 /** @brief Contains the listbox style */
 struct uiListBoxStyle {
-  RGB              backgroundColor                = RGB(2, 2, 2);                                   /**< Background color */
-  RGB              focusedBackgroundColor         = RGB(3, 3, 3);                                   /**< Background color when focused */
-  RGB              selectedBackgroundColor        = RGB(0, 0, 2);                                   /**< Background color when selected */
-  RGB              focusedSelectedBackgroundColor = RGB(0, 0, 3);                                   /**< Background color when selected and focused */
-  int              itemHeight                     = 16;                                             /**< Item height in pixels */
-  FontInfo const * textFont                       = Canvas.getPresetFontInfoFromHeight(14, false);  /**< Text font */
-  RGB              textColor                      = RGB(0, 0, 0);                                   /**< Text foreground color */
-  RGB              selectedTextColor              = RGB(3, 3, 3);                                   /**< Text foreground color when selected */
+  RGB888           backgroundColor                = RGB888(128, 128, 128);   /**< Background color */
+  RGB888           focusedBackgroundColor         = RGB888(255, 255, 255);   /**< Background color when focused */
+  RGB888           selectedBackgroundColor        = RGB888(0, 0, 128);       /**< Background color when selected */
+  RGB888           focusedSelectedBackgroundColor = RGB888(0, 0, 255);       /**< Background color when selected and focused */
+  int              itemHeight                     = 16;                      /**< Item height in pixels */
+  FontInfo const * textFont                       = &FONT_std_14;            /**< Text font */
+  RGB888           textColor                      = RGB888(0, 0, 0);         /**< Text foreground color */
+  RGB888           selectedTextColor              = RGB888(255, 255, 255);   /**< Text foreground color when selected */
 };
 
 
-/** @brief Contains a list of selectable items */
-class uiListBox : public uiScrollableControl {
+/** @brief Shows generic a list of selectable items */
+class uiCustomListBox : public uiScrollableControl {
 
 public:
 
@@ -1605,9 +1634,9 @@ public:
    * @param size The listbox size
    * @param visible If true the listbox is immediately visible
    */
-  uiListBox(uiWindow * parent, const Point & pos, const Size & size, bool visible = true);
+  uiCustomListBox(uiWindow * parent, const Point & pos, const Size & size, bool visible = true);
 
-  virtual ~uiListBox();
+  virtual ~uiCustomListBox();
 
   virtual void processEvent(uiEvent * event);
 
@@ -1617,16 +1646,6 @@ public:
    * @return L-value representing listbox style
    */
   uiListBoxStyle & listBoxStyle() { return m_listBoxStyle; }
-
-  /**
-   * @brief A list of strings representing the listbox content
-   *
-   * Other than actual strings, StringList indicates which items are selected.
-   * Repainting is required when the string list changes.
-   *
-   * @return L-value representing listbox items
-   */
-  StringList & items() { return m_items; }
 
   /**
    * @brief Gets the first selected item
@@ -1681,18 +1700,158 @@ protected:
 
   void setScrollBar(uiOrientation orientation, int position, int visible, int range, bool repaintScrollbar);
 
+  // must be implemented by inherited class
+  virtual int items_getCount()                              = 0;
+  virtual void items_deselectAll()                          = 0;
+  virtual void items_select(int index, bool select)         = 0;
+  virtual bool items_selected(int index)                    = 0;
+  virtual void items_draw(int index, const Rect & itemRect) = 0;
+
 private:
 
   void paintListBox();
   int getItemAtMousePos(int mouseX, int mouseY);
   void handleMouseDown(int mouseX, int mouseY);
   void handleKeyDown(uiKeyEventInfo key);
+  void makeItemVisible(int index);
 
 
   uiListBoxStyle m_listBoxStyle;
-  StringList     m_items;
   int            m_firstVisibleItem;     // the item on the top
 };
+
+
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// uiListBox
+
+/** @brief Shows a list of selectable string items */
+class uiListBox : public uiCustomListBox {
+
+public:
+
+  /**
+   * @brief Creates an instance of the object
+   *
+   * @param parent The parent window. A listbox must always have a parent window
+   * @param pos Top-left coordinates of the listbox relative to the parent
+   * @param size The listbox size
+   * @param visible If true the listbox is immediately visible
+   */
+  uiListBox(uiWindow * parent, const Point & pos, const Size & size, bool visible = true);
+
+  /**
+   * @brief A list of strings representing the listbox content
+   *
+   * Other than actual strings, StringList indicates which items are selected.
+   * Repainting is required when the string list changes.
+   *
+   * @return L-value representing listbox items
+   */
+  StringList & items() { return m_items; }
+
+protected:
+
+  virtual int items_getCount()                      { return m_items.count(); }
+  virtual void items_deselectAll()                  { m_items.deselectAll(); }
+  virtual void items_select(int index, bool select) { m_items.select(index, select); }
+  virtual bool items_selected(int index)            { return m_items.selected(index); }
+  virtual void items_draw(int index, const Rect & itemRect);
+
+
+private:
+
+  StringList     m_items;
+};
+
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// uiFileBrowser
+
+/** @brief Shows and navigates Virtual Filesystem content */
+class uiFileBrowser : public uiCustomListBox {
+
+public:
+
+  /**
+   * @brief Creates an instance of the object
+   *
+   * @param parent The parent window. A listbox must always have a parent window
+   * @param pos Top-left coordinates of the listbox relative to the parent
+   * @param size The listbox size
+   * @param visible If true the listbox is immediately visible
+   */
+  uiFileBrowser(uiWindow * parent, const Point & pos, const Size & size, bool visible = true);
+
+  /**
+   * @brief Sets current directory
+   *
+   * Path can include subdirectories (even SPIFFS emulated directories).
+   *
+   * @param path Absolute path. It musts include filesystem path (ie "/spiffs")
+   */
+  void setDirectory(char const * path);
+
+  /**
+   * @brief Determines current directory
+   *
+   * @return Full path of current directory
+   */
+  char const * directory() { return m_dir.directory(); }
+
+  /**
+   * @brief Determines number of files in current directory
+   *
+   * @return Number of files, included parent link ("..").
+   */
+  int count()              { return m_dir.count(); }
+
+  /**
+   * @brief Currently selected filename
+   *
+   * @return Currently selected filename or nullptr.
+   */
+  char const * filename();
+
+  /**
+   * @brief Determines whether currently selected item is a directory
+   *
+   * @return True if currently selected item is a directory. If False it is an ordinary file.
+   */
+  bool isDirectory();
+
+  void processEvent(uiEvent * event);
+
+  /**
+   * @brief Reloads current directory content and repaints
+   */
+  void update();
+
+  /**
+   * @brief Contains current directory representation
+   *
+   * @return A FileBrowser object which allows to know directory content and to manipulate it
+   */
+  FileBrowser & content() { return m_dir; }
+
+
+protected:
+
+  virtual int items_getCount()                      { return m_dir.count(); }
+  virtual void items_deselectAll()                  { m_selected = -1; }
+  virtual void items_select(int index, bool select);
+  virtual bool items_selected(int index)            { return index == m_selected; }
+  virtual void items_draw(int index, const Rect & itemRect);
+
+private:
+
+  void enterSubDir();
+
+  FileBrowser m_dir;
+  int         m_selected;  // -1 = no sel
+
+};
+
 
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1701,8 +1860,8 @@ private:
 
 /** @brief Contains the listbox style */
 struct uiComboBoxStyle {
-  RGB buttonBackgroundColor = RGB(1, 1, 1);  /**< Background color of open/close button */
-  RGB buttonColor           = RGB(2, 2, 2);  /**< Foreground color of open/close button */
+  RGB888 buttonBackgroundColor = RGB888(64, 64, 64);  /**< Background color of open/close button */
+  RGB888 buttonColor           = RGB888(128, 128, 128);  /**< Foreground color of open/close button */
 };
 
 
@@ -1745,7 +1904,7 @@ public:
    *
    * @return L-value representing combobox items
    */
-  StringList & items() { return m_listBox.items(); }
+  StringList & items() { return m_listBox->items(); }
 
   /**
    * @brief Sets or gets combobox style
@@ -1759,7 +1918,7 @@ public:
    *
    * @return L-value representing listbox style
    */
-  uiListBoxStyle & listBoxStyle() { return m_listBox.listBoxStyle(); }
+  uiListBoxStyle & listBoxStyle() { return m_listBox->listBoxStyle(); }
 
   /**
    * @brief Sets or gets combobox properties
@@ -1773,7 +1932,7 @@ public:
    *
    * @return Index of the selected item or -1 if no item is selected
    */
-  int selectedItem() { return m_listBox.firstSelectedItem(); }
+  int selectedItem() { return m_listBox->firstSelectedItem(); }
 
   /**
    * @brief Selects an item
@@ -1809,7 +1968,7 @@ private:
   void updateTextEdit();
 
 
-  uiListBox       m_listBox;
+  uiListBox *     m_listBox;
   int             m_listHeight;
   uiComboBoxStyle m_comboBoxStyle;
   uiComboBoxProps m_comboBoxProps;
@@ -1825,10 +1984,10 @@ private:
 
 /** @brief Contains the checkbox style */
 struct uiCheckBoxStyle {
-  RGB              backgroundColor          = RGB(2, 2, 2);  /**< Background color */
-  RGB              checkedBackgroundColor   = RGB(2, 2, 3);  /**< Background color when checked */
-  RGB              mouseOverBackgroundColor = RGB(2, 2, 3);  /**< Background color when mouse is over */
-  RGB              foregroundColor          = RGB(0, 0, 0);  /**< Foreground color */
+  RGB888              backgroundColor          = RGB888(128, 128, 128);  /**< Background color */
+  RGB888              checkedBackgroundColor   = RGB888(128, 128, 255);  /**< Background color when checked */
+  RGB888              mouseOverBackgroundColor = RGB888(128, 128, 255);  /**< Background color when mouse is over */
+  RGB888              foregroundColor          = RGB888(0, 0, 0);  /**< Foreground color */
 };
 
 
@@ -1936,11 +2095,11 @@ private:
 
 /** @brief Contains the slider style */
 struct uiSliderStyle {
-  RGB backgroundColor = RGB(3, 3, 3);    /**< Slider background color */
-  RGB slideColor      = RGB(0, 2, 2);    /**< Color of internal slide */
-  RGB rangeColor      = RGB(0, 2, 3);    /**< Color of slide before the grip */
-  RGB gripColor       = RGB(0, 0, 3);    /**< Color of slider grip */
-  RGB ticksColor      = RGB(3, 3, 3);    /**> Ticks color */
+  RGB888 backgroundColor = RGB888(255, 255, 255);    /**< Slider background color */
+  RGB888 slideColor      = RGB888(0, 128, 128);    /**< Color of internal slide */
+  RGB888 rangeColor      = RGB888(0, 128, 255);    /**< Color of slide before the grip */
+  RGB888 gripColor       = RGB888(0, 0, 255);    /**< Color of slider grip */
+  RGB888 ticksColor      = RGB888(255, 255, 255);    /**> Ticks color */
 };
 
 
@@ -2073,6 +2232,19 @@ enum class uiMessageBoxIcon {
 };
 
 
+struct ModalWindowState {
+  uiWindow * window;
+  uiWindow * prevFocusedWindow;
+  uiWindow * prevActiveWindow;
+  uiWindow * prevModal;
+  int        modalResult;
+};
+
+
+class Keyboard;
+class Mouse;
+
+
 /**
  * @brief Represents the whole application base class.
  *
@@ -2088,11 +2260,22 @@ public:
   virtual ~uiApp();
 
   /**
-   * @brief Initialize application and executes the main event loop
+   * @brief Initializes application and executes the main event loop
    *
-   * This is the last method that should be called: it never returns.
+   * @param displayController Specifies the display controller where to run the UI
+   * @param keyboard The keyboard device. The default (nullptr) gets it from the PS2Controller
+   * @param mouse The mouse device. The default (nullptr) gets it from the PS2Controller
+   *
+   * @return exitCode specified calling uiApp.quit().
    */
-  void run();
+  int run(DisplayController * displayController, Keyboard * keyboard = nullptr, Mouse * mouse = nullptr);
+
+  /**
+   * @brief Terminates application and free resources
+   *
+   * @param exitCode Value returned by uiApp.run().
+   */
+  void quit(int exitCode);
 
   /**
    * @brief Places an event in the event queue and returns without waiting for the receiver to process the event
@@ -2115,6 +2298,13 @@ public:
   void postDebugMsg(char const * msg);
 
   virtual void processEvent(uiEvent * event);
+
+  /**
+   * @brief Processes all events in queue
+   *
+   * This method is useful to update UI while running long time tasks.
+   */
+  void processEvents();
 
   /**
    * @brief Gets a pointer to the root window
@@ -2266,12 +2456,48 @@ public:
    *
    * A modal window disables the main window but keeps it visible. Users must interact with the modal window before they can return to the parent window.
    * A modal window exits from modal state using uiWindow.exitModal().
+   * showModalWindow() is the combination of initModalWindow(), processModalWindowEvents() and endModalWindow() called in sequence.
    *
    * @param window Window to be made visible and modal
    *
    * @return The same value specified calling uiWindow.exitModal()
    */
   int showModalWindow(uiWindow * window);
+
+  /**
+   * @brief Begins modal window processing
+   *
+   * initModalWindow(), processModalWindowEvents() and endModalWindow() are useful when a long processing operation is necessary inside a modal window.
+   *
+   * @param window The form to use as modal window
+   *
+   * @return Modal window status. This value must be passed to processModalWindowEvents() and endModalWindow() to maintain modal window state.
+   */
+  ModalWindowState * initModalWindow(uiWindow * window);
+
+  /**
+   * @brief Processes all messages from modal window
+   *
+   * This method must be called whenever UI needs to be updated.
+   *
+   * @param state This parameter comes from initModalWindow() and is used internally to maintain modal window status.
+   * @param timeout Timeout in milliseconds to wait for messages. -1 = infinite timeout, 0 = no timeout.
+   *
+   * @return False: EXIT or CLOSE received, modal window should close (call endModalWindow). True  = other processModalWindowEvents required, continue outer loop.
+   */
+  bool processModalWindowEvents(ModalWindowState * state, int timeout);
+
+  /**
+   * @brief Ends modal window processing
+   *
+   * Ends the modal window status. After this other windows can receive input.
+   * This method should be always called when processModalWindowEvents() returns False, or when modal window must be anyway closed.
+   *
+   * @param state This parameter comes from initModalWindow() and is used internally to maintain modal window status.
+   *
+   * @return The same value specified calling uiWindow.exitModal()
+   */
+  int endModalWindow(ModalWindowState * state);
 
   /**
    * @brief Maximizes or restores a window
@@ -2338,6 +2564,15 @@ public:
   void cleanWindowReferences(uiWindow * window);
 
   /**
+   * @brief Enables or disables mouse and keyboard events
+   *
+   * For default mouse and keyboard events are enabled.
+   *
+   * @param value True to enable events, False to disable events
+   */
+  void enableKeyboardAndMouseEvents(bool value);
+
+  /**
    * @brief Displays a modal dialog box with an icon, text and some buttons
    *
    * @param title The dialog box title. If nullptr the messaebox has no title bar
@@ -2351,6 +2586,22 @@ public:
    */
   uiMessageBoxResult messageBox(char const * title, char const * text, char const * button1Text, char const * button2Text = nullptr, char const * button3Text = nullptr, uiMessageBoxIcon icon = uiMessageBoxIcon::Question);
 
+  /**
+   * @brief Displays a modal dialog box with a text, a text edit and up to two buttons
+   *
+   * Pressing ENTER (RETURN) equals to press first button.
+   * Pressing ESC cancels the dialog box.
+   *
+   * @param title The dialog box title. If nullptr the messaebox has no title bar
+   * @param text The message to be displayed
+   * @param inOutString Initial string of the text edit
+   * @param maxLength Maximum length of inOutString buffer (ending zero not included)
+   * @param button1Text Left button text
+   * @param button2Text Right button text (may be nullptr, if not present)
+   *
+   * @return Message box result
+   */
+  uiMessageBoxResult inputBox(char const * title, char const * text, char * inOutString, int maxLength, char const * button1Text, char const * button2Text = nullptr);
 
   /**
    * @brief Method to inherit to implement an application
@@ -2366,6 +2617,15 @@ public:
    * To create a timer use uiApp.setTimer().
    */
   Delegate<uiTimerHandle> onTimer;
+
+  Keyboard * keyboard() { return m_keyboard; }
+
+  Mouse * mouse() { return m_mouse; }
+
+  DisplayController * displayController() { return m_displayController; }
+
+  Canvas * canvas() { return m_canvas; }
+
 
 protected:
 
@@ -2386,31 +2646,39 @@ private:
   void suspendCaret(bool value);
 
 
-  uiAppProps    m_appProps;
+  DisplayController * m_displayController;
 
-  QueueHandle_t m_eventsQueue;
+  Canvas *        m_canvas;
 
-  uiFrame *     m_rootWindow;
+  Keyboard *      m_keyboard;
 
-  uiWindow *    m_activeWindow;        // foreground window. Also gets keyboard events (other than focused window)
+  Mouse *         m_mouse;
 
-  uiWindow *    m_focusedWindow;       // window that captures keyboard events (other than active window)
+  uiAppProps      m_appProps;
 
-  uiWindow *    m_capturedMouseWindow; // window that has captured mouse
+  QueueHandle_t   m_eventsQueue;
 
-  uiWindow *    m_freeMouseWindow;     // window where mouse is over
+  uiFrame *       m_rootWindow;
 
-  uiWindow *    m_modalWindow;         // current modal window
+  uiWindow *      m_activeWindow;        // foreground window. Also gets keyboard events (other than focused window)
 
-  bool          m_combineMouseMoveEvents;
+  uiWindow *      m_focusedWindow;       // window that captures keyboard events (other than active window)
 
-  uiWindow *    m_caretWindow;         // nullptr = caret is not visible
-  Rect          m_caretRect;           // caret rect relative to m_caretWindow
-  uiTimerHandle m_caretTimer;
-  int           m_caretInvertState;    // -1 = suspended, 1 = rect reversed (cat visible), 0 = rect not reversed (caret invisible)
+  uiWindow *      m_capturedMouseWindow; // window that has captured mouse
 
-  int           m_lastMouseUpTimeMS;   // time (MS) at mouse up. Used to measure double clicks
-  Point         m_lastMouseUpPos;      // screen position of last mouse up
+  uiWindow *      m_freeMouseWindow;     // window where mouse is over
+
+  uiWindow *      m_modalWindow;         // current modal window
+
+  bool            m_combineMouseMoveEvents;
+
+  uiWindow *      m_caretWindow;         // nullptr = caret is not visible
+  Rect            m_caretRect;           // caret rect relative to m_caretWindow
+  uiTimerHandle   m_caretTimer;
+  int             m_caretInvertState;    // -1 = suspended, 1 = rect reversed (cat visible), 0 = rect not reversed (caret invisible)
+
+  int             m_lastMouseUpTimeMS;   // time (MS) at mouse up. Used to measure double clicks
+  Point           m_lastMouseUpPos;      // screen position of last mouse up
 };
 
 

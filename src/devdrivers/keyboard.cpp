@@ -20,7 +20,8 @@
  */
 
 
-#include "Arduino.h"
+
+#include <string.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -28,10 +29,6 @@
 #include "freertos/queue.h"
 
 #include "keyboard.h"
-
-
-fabgl::KeyboardClass Keyboard;
-
 
 
 
@@ -395,21 +392,22 @@ const KeyboardLayout ItalianLayout {
 };
 
 
-KeyboardClass::KeyboardClass()
+Keyboard::Keyboard()
   : m_keyboardAvailable(false)
 {
 }
 
 
-void KeyboardClass::begin(bool generateVirtualKeys, bool createVKQueue, int PS2Port)
+void Keyboard::begin(bool generateVirtualKeys, bool createVKQueue, int PS2Port)
 {
-  PS2DeviceClass::begin(PS2Port);
+  PS2Device::begin(PS2Port);
 
-  m_CTRL     = false;
-  m_ALT      = false;
-  m_SHIFT    = false;
-  m_CAPSLOCK = false;
-  m_NUMLOCK  = false;
+  m_CTRL       = false;
+  m_ALT        = false;
+  m_SHIFT      = false;
+  m_CAPSLOCK   = false;
+  m_NUMLOCK    = false;
+  m_SCROLLLOCK = false;
 
   m_numLockLED     = false;
   m_capsLockLED    = false;
@@ -430,32 +428,36 @@ void KeyboardClass::begin(bool generateVirtualKeys, bool createVKQueue, int PS2P
 }
 
 
-void KeyboardClass::begin(gpio_num_t clkGPIO, gpio_num_t dataGPIO, bool generateVirtualKeys, bool createVKQueue)
+void Keyboard::begin(gpio_num_t clkGPIO, gpio_num_t dataGPIO, bool generateVirtualKeys, bool createVKQueue)
 {
-  PS2Controller.begin(clkGPIO, dataGPIO);
+  PS2Controller * PS2 = PS2Controller::instance();
+  PS2->begin(clkGPIO, dataGPIO);
+  PS2->setKeyboard(this);
   begin(generateVirtualKeys, createVKQueue, 0);
 }
 
 
 // reset keyboard, set scancode 2 and US layout
-bool KeyboardClass::reset()
+bool Keyboard::reset()
 {
+  memset(m_VKMap, 0, sizeof(m_VKMap));
+
   // sets default layout
-  Keyboard.setLayout(&USLayout);
+  setLayout(&USLayout);
 
   // tries up to three times to reset keyboard
   for (int i = 0; i < 3; ++i) {
     m_keyboardAvailable = send_cmdReset() && send_cmdSetScancodeSet(2);
     if (m_keyboardAvailable)
       break;
-    delay(500);
+    vTaskDelay(500 / portTICK_PERIOD_MS);
   }
 
   return m_keyboardAvailable;
 }
 
 
-void KeyboardClass::getLEDs(bool * numLock, bool * capsLock, bool * scrollLock)
+void Keyboard::getLEDs(bool * numLock, bool * capsLock, bool * scrollLock)
 {
   *numLock    = m_numLockLED;
   *capsLock   = m_capsLockLED;
@@ -463,13 +465,13 @@ void KeyboardClass::getLEDs(bool * numLock, bool * capsLock, bool * scrollLock)
 }
 
 
-int KeyboardClass::scancodeAvailable()
+int Keyboard::scancodeAvailable()
 {
   return dataAvailable();
 }
 
 
-int KeyboardClass::getNextScancode(int timeOutMS, bool requestResendOnTimeOut)
+int Keyboard::getNextScancode(int timeOutMS, bool requestResendOnTimeOut)
 {
   while (true) {
     int r = getData(timeOutMS);
@@ -482,7 +484,7 @@ int KeyboardClass::getNextScancode(int timeOutMS, bool requestResendOnTimeOut)
 }
 
 
-void KeyboardClass::updateLEDs()
+void Keyboard::updateLEDs()
 {
   send_cmdLEDs(m_NUMLOCK, m_CAPSLOCK, m_SCROLLLOCK);
   m_numLockLED    = m_NUMLOCK;
@@ -491,14 +493,14 @@ void KeyboardClass::updateLEDs()
 }
 
 
-void KeyboardClass::setLayout(const KeyboardLayout * layout)
+void Keyboard::setLayout(const KeyboardLayout * layout)
 {
   m_layout = layout;
 }
 
 
 #if FABGLIB_HAS_VirtualKeyO_STRING
-char const * KeyboardClass::virtualKeyToString(VirtualKey virtualKey)
+char const * Keyboard::virtualKeyToString(VirtualKey virtualKey)
 {
   char const * VKTOSTR[] = { "VK_NONE", "VK_SPACE", "VK_0", "VK_1", "VK_2", "VK_3", "VK_4", "VK_5", "VK_6", "VK_7", "VK_8", "VK_9", "VK_KP_0", "VK_KP_1", "VK_KP_2",
                              "VK_KP_3", "VK_KP_4", "VK_KP_5", "VK_KP_6", "VK_KP_7", "VK_KP_8", "VK_KP_9", "VK_a", "VK_b", "VK_c", "VK_d", "VK_e", "VK_f", "VK_g", "VK_h",
@@ -520,7 +522,7 @@ char const * KeyboardClass::virtualKeyToString(VirtualKey virtualKey)
 
 
 // -1 = virtual key cannot be translated to ASCII
-int KeyboardClass::virtualKeyToASCII(VirtualKey virtualKey)
+int Keyboard::virtualKeyToASCII(VirtualKey virtualKey)
 {
   switch (virtualKey) {
     case VK_SPACE:
@@ -716,7 +718,7 @@ int KeyboardClass::virtualKeyToASCII(VirtualKey virtualKey)
 }
 
 
-VirtualKey KeyboardClass::scancodeToVK(uint8_t scancode, bool isExtended, KeyboardLayout const * layout)
+VirtualKey Keyboard::scancodeToVK(uint8_t scancode, bool isExtended, KeyboardLayout const * layout)
 {
   VirtualKey vk = VK_NONE;
 
@@ -737,7 +739,7 @@ VirtualKey KeyboardClass::scancodeToVK(uint8_t scancode, bool isExtended, Keyboa
 }
 
 
-VirtualKey KeyboardClass::VKtoAlternateVK(VirtualKey in_vk, KeyboardLayout const * layout)
+VirtualKey Keyboard::VKtoAlternateVK(VirtualKey in_vk, KeyboardLayout const * layout)
 {
   VirtualKey vk = VK_NONE;
 
@@ -761,7 +763,7 @@ VirtualKey KeyboardClass::VKtoAlternateVK(VirtualKey in_vk, KeyboardLayout const
 }
 
 
-VirtualKey KeyboardClass::blockingGetVirtualKey(bool * keyDown)
+VirtualKey Keyboard::blockingGetVirtualKey(bool * keyDown)
 {
   VirtualKey vk = VK_NONE;
   bool kdown = true;
@@ -851,42 +853,44 @@ VirtualKey KeyboardClass::blockingGetVirtualKey(bool * keyDown)
 }
 
 
-void KeyboardClass::SCodeToVKConverterTask(void * pvParameters)
+void Keyboard::SCodeToVKConverterTask(void * pvParameters)
 {
+  Keyboard * keyboard = (Keyboard*) pvParameters;
   while (true) {
     bool keyDown;
-    VirtualKey vk = Keyboard.blockingGetVirtualKey(&keyDown);
+    VirtualKey vk = keyboard->blockingGetVirtualKey(&keyDown);
     if (vk != VK_NONE) {
 
       // update m_VKMap
       if (keyDown)
-        Keyboard.m_VKMap[(int)vk >> 3] |= 1 << ((int)vk & 7);
+        keyboard->m_VKMap[(int)vk >> 3] |= 1 << ((int)vk & 7);
       else
-        Keyboard.m_VKMap[(int)vk >> 3] &= ~(1 << ((int)vk & 7));
+        keyboard->m_VKMap[(int)vk >> 3] &= ~(1 << ((int)vk & 7));
 
       // has VK queue? Insert VK into it.
-      if (Keyboard.m_virtualKeyQueue) {
+      if (keyboard->m_virtualKeyQueue) {
         uint16_t code = (uint16_t)vk | (keyDown ? 0x8000 : 0);
-        xQueueSendToBack(Keyboard.m_virtualKeyQueue, &code, portMAX_DELAY);
+        xQueueSendToBack(keyboard->m_virtualKeyQueue, &code, (keyboard->m_uiApp ? 0 : portMAX_DELAY));  // 0, and not portMAX_DELAY to avoid uiApp locks
       }
 
       // need to send events to uiApp?
-      if (Keyboard.m_uiApp) {
+      if (keyboard->m_uiApp) {
         uiEvent evt = uiEvent(nullptr, keyDown ? UIEVT_KEYDOWN : UIEVT_KEYUP);
         evt.params.key.VK    = vk;
-        evt.params.key.LALT  = Keyboard.isVKDown(VK_LALT);
-        evt.params.key.RALT  = Keyboard.isVKDown(VK_RALT);
-        evt.params.key.CTRL  = Keyboard.isVKDown(VK_LCTRL) || Keyboard.isVKDown(VK_RCTRL);
-        evt.params.key.SHIFT = Keyboard.isVKDown(VK_LSHIFT) || Keyboard.isVKDown(VK_RSHIFT);
-        evt.params.key.GUI   = Keyboard.isVKDown(VK_LGUI) || Keyboard.isVKDown(VK_RGUI);
-        Keyboard.m_uiApp->postEvent(&evt);
+        evt.params.key.LALT  = keyboard->isVKDown(VK_LALT);
+        evt.params.key.RALT  = keyboard->isVKDown(VK_RALT);
+        evt.params.key.CTRL  = keyboard->isVKDown(VK_LCTRL)  || keyboard->isVKDown(VK_RCTRL);
+        evt.params.key.SHIFT = keyboard->isVKDown(VK_LSHIFT) || keyboard->isVKDown(VK_RSHIFT);
+        evt.params.key.GUI   = keyboard->isVKDown(VK_LGUI)   || keyboard->isVKDown(VK_RGUI);
+        keyboard->m_uiApp->postEvent(&evt);
       }
+
     }
   }
 }
 
 
-void KeyboardClass::suspendVirtualKeyGeneration(bool value)
+void Keyboard::suspendVirtualKeyGeneration(bool value)
 {
   if (value)
     vTaskSuspend(m_SCodeToVKConverterTask);
@@ -895,19 +899,19 @@ void KeyboardClass::suspendVirtualKeyGeneration(bool value)
 }
 
 
-bool KeyboardClass::isVKDown(VirtualKey virtualKey)
+bool Keyboard::isVKDown(VirtualKey virtualKey)
 {
   bool r = m_VKMap[(int)virtualKey >> 3] & (1 << ((int)virtualKey & 7));
 
   // VK_PAUSE is never released (no scancode sent from keyboard on key up), so when queried it is like released
   if (virtualKey == VK_PAUSE)
-    Keyboard.m_VKMap[(int)virtualKey >> 3] &= ~(1 << ((int)virtualKey & 7));
+    m_VKMap[(int)virtualKey >> 3] &= ~(1 << ((int)virtualKey & 7));
 
   return r;
 }
 
 
-VirtualKey KeyboardClass::getNextVirtualKey(bool * keyDown, int timeOutMS)
+VirtualKey Keyboard::getNextVirtualKey(bool * keyDown, int timeOutMS)
 {
   VirtualKey vk = VK_NONE;
   if (m_SCodeToVKConverterTask) {
@@ -922,9 +926,15 @@ VirtualKey KeyboardClass::getNextVirtualKey(bool * keyDown, int timeOutMS)
 }
 
 
-int KeyboardClass::virtualKeyAvailable()
+int Keyboard::virtualKeyAvailable()
 {
   return m_virtualKeyQueue ? uxQueueMessagesWaiting(m_virtualKeyQueue) : 0;
+}
+
+
+void Keyboard::emptyVirtualKeyQueue()
+{
+  xQueueReset(m_virtualKeyQueue);
 }
 
 

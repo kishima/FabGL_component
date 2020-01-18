@@ -30,8 +30,8 @@
 #include "fabutils.h"
 #include "fabui.h"
 #include "canvas.h"
-#include "mouse.h"
-#include "keyboard.h"
+#include "devdrivers/mouse.h"
+#include "devdrivers/keyboard.h"
 #include "images/bitmaps.h"
 
 
@@ -51,6 +51,7 @@ void dumpEvent(uiEvent * event)
                                   "UIEVT_MOUSEENTER", "UIEVT_MOUSELEAVE", "UIEVT_MAXIMIZE", "UIEVT_MINIMIZE", "UIEVT_RESTORE",
                                   "UIEVT_SHOW", "UIEVT_HIDE", "UIEVT_SETFOCUS", "UIEVT_KILLFOCUS", "UIEVT_KEYDOWN", "UIEVT_KEYUP",
                                   "UIEVT_TIMER", "UIEVT_DBLCLICK", "UIEVT_DBLCLICK", "UIEVT_EXITMODAL", "UIEVT_DESTROY", "UIEVT_CLOSE",
+                                  "UIEVT_QUIT",
                                 };
   Serial.printf("#%d ", idx++);
   Serial.write(TOSTR[event->id]);
@@ -175,39 +176,55 @@ uiApp::uiApp()
     m_lastMouseUpTimeMS(0)
 {
   objectType().uiApp = true;
-  m_eventsQueue = xQueueCreate(FABGLIB_UI_EVENTS_QUEUE_SIZE, sizeof(uiEvent));
   setApp(this);
 }
 
 
 uiApp::~uiApp()
 {
-  showCaret(nullptr);
-  vQueueDelete(m_eventsQueue);
-  delete m_rootWindow;
 }
 
 
-void uiApp::run()
+int uiApp::run(DisplayController * displayController, Keyboard * keyboard, Mouse * mouse)
 {
+  m_displayController = displayController;
+
+  m_canvas            = new Canvas(m_displayController);
+
+  m_keyboard = keyboard;
+  m_mouse    = mouse;
+  if (PS2Controller::instance()) {
+    // get default keyboard and mouse from the PS/2 controller
+    if (m_keyboard == nullptr)
+      m_keyboard = PS2Controller::instance()->keyboard();
+    if (m_mouse == nullptr)
+      m_mouse = PS2Controller::instance()->mouse();
+  }
+
+  m_eventsQueue = xQueueCreate(FABGLIB_UI_EVENTS_QUEUE_SIZE, sizeof(uiEvent));
+
   // setup absolute events from mouse
-  Mouse.setupAbsolutePositioner(Canvas.getWidth(), Canvas.getHeight(), false, true, this);
+  m_mouse->setupAbsolutePositioner(m_canvas->getWidth(), m_canvas->getHeight(), false, m_displayController, this);
 
   // setup keyboard
-  Keyboard.setUIApp(this);
+  m_keyboard->setUIApp(this);
 
   // root window always stays at 0, 0 and cannot be moved
-  m_rootWindow = new uiFrame(nullptr, "", Point(0, 0), Size(Canvas.getWidth(), Canvas.getHeight()), false);
+  m_rootWindow = new uiFrame(nullptr, "", Point(0, 0), Size(m_canvas->getWidth(), m_canvas->getHeight()), false);
   m_rootWindow->setApp(this);
+  m_rootWindow->setCanvas(m_canvas);
 
   m_rootWindow->windowStyle().borderSize     = 0;
-  m_rootWindow->frameStyle().backgroundColor = RGB(3, 3, 3);
+  m_rootWindow->frameStyle().backgroundColor = RGB888(255, 255, 255);
 
   m_rootWindow->frameProps().resizeable = false;
   m_rootWindow->frameProps().moveable   = false;
 
   // setup mouse cursor (otherwise it has to wait mouse first moving to show mouse pointer)
-  VGAController.setMouseCursor(m_rootWindow->windowStyle().defaultCursor);
+  m_displayController->setMouseCursor(m_rootWindow->windowStyle().defaultCursor);
+
+  // avoid slow paint on low resolutions
+  m_displayController->enableBackgroundPrimitiveTimeout(false);
 
   showWindow(m_rootWindow, true);
 
@@ -216,6 +233,8 @@ void uiApp::run()
   // generate UIEVT_APPINIT event
   uiEvent evt = uiEvent(this, UIEVT_APPINIT);
   postEvent(&evt);
+
+  int exitCode = 0;
 
   // dispatch events
   while (true) {
@@ -229,8 +248,57 @@ void uiApp::run()
 
       if (event.dest)
         event.dest->processEvent(&event);
+
+      if (event.id == UIEVT_QUIT) {
+        exitCode = event.params.exitCode;
+        break;
+      }
     }
   }
+
+  showCaret(nullptr);
+
+  m_displayController->setMouseCursor(nullptr);
+
+  m_canvas->setBrushColor(m_rootWindow->frameStyle().backgroundColor);
+  m_canvas->clear();
+
+  delete m_rootWindow;
+  m_rootWindow = nullptr;
+
+  m_keyboard->setUIApp(nullptr);
+
+  m_mouse->terminateAbsolutePositioner();
+
+  vQueueDelete(m_eventsQueue);
+  m_eventsQueue = nullptr;
+
+  delete m_canvas;
+
+  return exitCode;
+}
+
+
+void uiApp::processEvents()
+{
+  uiEvent event;
+  while (getEvent(&event, 0)) {
+
+    preprocessEvent(&event);
+
+    if (event.dest)
+      event.dest->processEvent(&event);
+  }
+}
+
+
+void uiApp::quit(int exitCode)
+{
+  for (auto child = m_rootWindow->lastChild(); child; child = child->prev())
+    destroyWindow(child);
+  uiEvent evt = uiEvent(nullptr, UIEVT_QUIT);
+  evt.params.exitCode = exitCode;
+  postEvent(&evt);
 }
 
 
@@ -288,7 +356,7 @@ void uiApp::filterModalEvent(uiEvent * event)
         event->dest = nullptr;
         if (event->id == UIEVT_MOUSEENTER) {
           // a little hack to set the right mouse pointer exiting from modal window
-          VGAController.setMouseCursor(m_modalWindow->windowStyle().defaultCursor);
+          m_displayController->setMouseCursor(m_modalWindow->windowStyle().defaultCursor);
         }
         break;
 
@@ -624,47 +692,72 @@ void uiApp::showWindow(uiWindow * window, bool value)
 }
 
 
+ModalWindowState * uiApp::initModalWindow(uiWindow * window)
+{
+  showWindow(window, true);
+
+  auto state = new ModalWindowState;
+  state->window            = window;
+  state->modalResult       = -1;
+  state->prevFocusedWindow = setFocusedWindow(nullptr);
+  state->prevActiveWindow  = setActiveWindow(window);
+  state->prevModal         = m_modalWindow;
+
+  return state;
+}
+
+
+// ret:
+//   false = EXIT or CLOSE received, modal window should close (call endModalWindow)
+//   true  = other processModalWindowEvents required, continue outer loop
+bool uiApp::processModalWindowEvents(ModalWindowState * state, int timeout)
+{
+  // a new inner event loop...
+  uiEvent event;
+  while (getEvent(&event, timeout)) {
+
+    if (m_modalWindow != state->window && event.dest == state->window) {
+      // becomes modal when first message arrives
+      m_modalWindow = state->window;
+    }
+    if (event.id == UIEVT_EXITMODAL) {
+      // clean exit using exitModal() method
+      state->modalResult = event.params.modalResult;
+      return false;
+    } else if (event.id == UIEVT_CLOSE) {
+      // exit using Close button (default return value remains -1)
+      return false;
+    }
+
+    preprocessEvent(&event);
+
+    if (event.dest)
+      event.dest->processEvent(&event);
+
+  }
+  return true;
+}
+
+
+// ret: modal result
+int uiApp::endModalWindow(ModalWindowState * state)
+{
+  m_modalWindow = state->prevModal;
+  setActiveWindow(state->prevActiveWindow);
+  showWindow(state->window, false);
+  setFocusedWindow(state->prevFocusedWindow);
+  int result = state->modalResult;
+  free(state);
+  return result;
+}
+
+
 int uiApp::showModalWindow(uiWindow * window)
 {
-  int modalResult = -1;
-
-  showWindow(window, true);
-  uiWindow * prevFocusedWindow = setFocusedWindow(nullptr);
-  uiWindow * prevActiveWindow = setActiveWindow(window);
-  uiWindow * prevModal = m_modalWindow;
-
-  // a new inner event loop...
-  while (true) {
-    uiEvent event;
-    if (getEvent(&event, -1)) {
-
-      if (m_modalWindow != window && event.dest == window) {
-        // becomes modal when first message arrives
-        m_modalWindow = window;
-      }
-      if (event.id == UIEVT_EXITMODAL) {
-        // clean exit using exitModal() method
-        modalResult = event.params.modalResult;
-        break;
-      } else if (event.id == UIEVT_CLOSE) {
-        // exit using Close button (default return value remains -1)
-        break;
-      }
-
-      preprocessEvent(&event);
-
-      if (event.dest)
-        event.dest->processEvent(&event);
-
-    }
-  }
-
-  m_modalWindow = prevModal;
-  setActiveWindow(prevActiveWindow);
-  showWindow(window, false);
-  setFocusedWindow(prevFocusedWindow);
-
-  return modalResult;
+  auto state = initModalWindow(window);
+  while (processModalWindowEvents(state, -1))
+    ;
+  return endModalWindow(state);
 }
 
 
@@ -772,11 +865,11 @@ void uiApp::setCaret(Rect const & rect)
 void uiApp::blinkCaret(bool forceOFF)
 {
   if (m_caretWindow && m_caretInvertState != -1 && (forceOFF == false || m_caretInvertState == 1)) {
-    Canvas.resetPaintOptions();
-    Canvas.setOrigin(m_rootWindow->pos());
-    Canvas.setClippingRect(m_caretWindow->clientRect(uiOrigin::Screen));
+    m_canvas->resetPaintOptions();
+    m_canvas->setOrigin(m_rootWindow->pos());
+    m_canvas->setClippingRect(m_caretWindow->clientRect(uiOrigin::Screen));
     Rect aRect = m_caretWindow->transformRect(m_caretRect, m_rootWindow);
-    Canvas.invertRectangle(aRect);
+    m_canvas->invertRectangle(aRect);
     m_caretInvertState = m_caretInvertState ? 0 : 1;
   }
 }
@@ -824,12 +917,12 @@ void uiApp::cleanWindowReferences(uiWindow * window)
 
 uiMessageBoxResult uiApp::messageBox(char const * title, char const * text, char const * button1Text, char const * button2Text, char const * button3Text, uiMessageBoxIcon icon)
 {
-  auto font = Canvas.getPresetFontInfoFromHeight(14, false);
+  auto font = &FONT_std_14;
   const int titleHeight = title && strlen(title) ? font->height : 0;
-  const int textExtent = Canvas.textExtent(font, text);
-  const int button1Extent = button1Text ? Canvas.textExtent(font, button1Text) + 10 : 0;
-  const int button2Extent = button2Text ? Canvas.textExtent(font, button2Text) + 10 : 0;
-  const int button3Extent = button3Text ? Canvas.textExtent(font, button3Text) + 10 : 0;
+  const int textExtent = m_canvas->textExtent(font, text);
+  const int button1Extent = button1Text ? m_canvas->textExtent(font, button1Text) + 10 : 0;
+  const int button2Extent = button2Text ? m_canvas->textExtent(font, button2Text) + 10 : 0;
+  const int button3Extent = button3Text ? m_canvas->textExtent(font, button3Text) + 10 : 0;
   const int buttonsWidth  = imax(imax(imax(button1Extent, button2Extent), button3Extent), 40);
   int totButtons = 0;
   if (button1Extent)
@@ -848,10 +941,10 @@ uiMessageBoxResult uiApp::messageBox(char const * title, char const * text, char
   constexpr int buttonsSpace = 10;
   const int bitmapSpace = bitmap ? 8 : 0;
   const int textHeight = imax(font->height, bitmapHeight);
-  const int requiredWidth  = imin(imax(bitmapWidth + bitmapSpace + textExtent + 10, buttonsWidth * totButtons + (2 + buttonsSpace) * totButtons), Canvas.getWidth());
+  const int requiredWidth  = imin(imax(bitmapWidth + bitmapSpace + textExtent + 10, buttonsWidth * totButtons + (2 + buttonsSpace) * totButtons), m_canvas->getWidth());
   const int requiredHeight = textHeight + buttonsHeight + titleHeight + font->height * 3;
-  const int frameX = (Canvas.getWidth() - requiredWidth) / 2;
-  const int frameY = (Canvas.getHeight() - requiredHeight) / 2;
+  const int frameX = (m_canvas->getWidth() - requiredWidth) / 2;
+  const int frameY = (m_canvas->getHeight() - requiredHeight) / 2;
 
   auto mainFrame = new uiFrame(m_rootWindow, title, Point(frameX, frameY), Size(requiredWidth, requiredHeight), false);
   mainFrame->frameProps().resizeable        = false;
@@ -872,7 +965,7 @@ uiMessageBoxResult uiApp::messageBox(char const * title, char const * text, char
 
   y += textHeight + titleHeight;
   auto panel = new uiPanel(mainFrame, Point(0, y), Size(mainFrame->size().width, mainFrame->size().height - y));
-  panel->windowStyle().borderColor = RGB(2, 2, 2);
+  panel->windowStyle().borderColor = RGB888(128, 128, 128);
   panel->panelStyle().backgroundColor = mainFrame->frameStyle().backgroundColor;
 
   // setup buttons
@@ -921,6 +1014,109 @@ uiMessageBoxResult uiApp::messageBox(char const * title, char const * text, char
 }
 
 
+uiMessageBoxResult uiApp::inputBox(char const * title, char const * text, char * inOutString, int maxLength, char const * button1Text, char const * button2Text)
+{
+  auto font = &FONT_std_14;
+  const int titleHeight   = title && strlen(title) ? font->height : 0;
+  const int textExtent    = m_canvas->textExtent(font, text);
+  const int editExtent    = imin(maxLength * m_canvas->textExtent(font, "M"), m_rootWindow->clientSize().width / 2 - textExtent);
+  const int button1Extent = button1Text ? m_canvas->textExtent(font, button1Text) + 10 : 0;
+  const int button2Extent = button2Text ? m_canvas->textExtent(font, button2Text) + 10 : 0;
+  const int buttonsWidth  = imax(imax(button1Extent, button2Extent), 40);
+  int totButtons = 0;
+  if (button1Extent)
+    ++totButtons;
+  if (button2Extent)
+    ++totButtons;
+  const int buttonsHeight    = font->height + 6;
+  const int textHeight       = font->height;
+  constexpr int buttonsSpace = 10;
+  const int requiredWidth    = imin(imax(editExtent + textExtent + 10, buttonsWidth * totButtons + (2 + buttonsSpace) * totButtons), m_canvas->getWidth());
+  const int requiredHeight   = textHeight + buttonsHeight + titleHeight + font->height * 3;
+  const int frameX           = (m_canvas->getWidth() - requiredWidth) / 2;
+  const int frameY           = (m_canvas->getHeight() - requiredHeight) / 2;
+
+  auto mainFrame = new uiFrame(m_rootWindow, title, Point(frameX, frameY), Size(requiredWidth, requiredHeight), false);
+  mainFrame->frameProps().resizeable        = false;
+  mainFrame->frameProps().hasMaximizeButton = false;
+  mainFrame->frameProps().hasMinimizeButton = false;
+  mainFrame->onKeyUp = [&](uiKeyEventInfo key) {
+    if (key.VK == VK_RETURN)
+      mainFrame->exitModal(1);
+    else if (key.VK == VK_ESCAPE)
+      mainFrame->exitModal(0);
+  };
+
+  int x = 10;
+  int y = font->height + titleHeight + (textHeight - font->height) / 2;
+  new uiLabel(mainFrame, text, Point(x, y));
+
+  auto edit = new uiTextEdit(mainFrame, inOutString, Point(x + textExtent + 5, y - 4), Size(editExtent - 15, textHeight + 6));
+
+  // setup panel (where buttons are positioned)
+
+  y += textHeight + titleHeight;
+  auto panel = new uiPanel(mainFrame, Point(0, y), Size(mainFrame->size().width, mainFrame->size().height - y));
+  panel->windowStyle().borderColor = RGB888(128, 128, 128);
+  panel->panelStyle().backgroundColor = mainFrame->frameStyle().backgroundColor;
+
+  // setup buttons
+
+  y = (panel->size().height - buttonsHeight) / 2;
+  x = mainFrame->windowStyle().borderSize + requiredWidth - buttonsWidth * totButtons - buttonsSpace * totButtons;  // right aligned
+
+  auto button1 = button1Text ? new uiButton(panel, button1Text, Point(x, y), Size(buttonsWidth, buttonsHeight)) : nullptr;
+  if (button1) {
+    button1->onClick = [&]() { mainFrame->exitModal(1); };
+    x += buttonsWidth + buttonsSpace;
+  }
+
+  auto button2 = button2Text ? new uiButton(panel, button2Text, Point(x, y), Size(buttonsWidth, buttonsHeight)) : nullptr;
+  if (button2) {
+    button2->onClick = [&]() { mainFrame->exitModal(2); };
+    x += buttonsWidth + buttonsSpace;
+  }
+
+  // focus on edit
+  mainFrame->onShow = [&]() {
+    setFocusedWindow(edit);
+  };
+
+  // run
+
+  int modalResult = showModalWindow(mainFrame);
+  destroyWindow(mainFrame);
+
+  switch (modalResult) {
+    case 1:
+    {
+      int len = imin(maxLength, strlen(edit->text()));
+      memcpy(inOutString, edit->text(), len);
+      inOutString[len] = 0;
+      return uiMessageBoxResult::Button1;
+    }
+    case 2:
+      return uiMessageBoxResult::Button2;
+    default:
+      return uiMessageBoxResult::Cancel;
+  }
+}
+
+
+void uiApp::enableKeyboardAndMouseEvents(bool value)
+{
+  if (value) {
+    m_keyboard->setUIApp(this);
+    m_mouse->setUIApp(this);
+    m_displayController->setMouseCursor(m_rootWindow->windowStyle().defaultCursor);
+  } else {
+    m_keyboard->setUIApp(nullptr);
+    m_mouse->setUIApp(nullptr);
+    m_displayController->setMouseCursor(nullptr);
+  }
+}
+
+
 // uiApp
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -949,10 +1145,13 @@ uiWindow::uiWindow(uiWindow * parent, const Point & pos, const Size & size, bool
   m_state.minimized = false;
   m_state.active    = false;
 
+  if (app())
+    m_canvas = app()->canvas();
+
   if (parent)
     parent->addChild(this);
 
-  if (visible)
+  if (visible && app())
     app()->showWindow(this, true);
 
   m_focusIndex = prev() ? prev()->m_focusIndex + 1 : 0;
@@ -1139,10 +1338,10 @@ Point uiWindow::clientPos()
 void uiWindow::beginPaint(uiEvent * paintEvent, Rect const & clippingRect)
 {
   Rect srect = rect(uiOrigin::Screen);
-  Canvas.setOrigin(srect.X1, srect.Y1);
-  Canvas.setClippingRect( clippingRect.intersection(paintEvent->params.rect) );
-  Canvas.resetGlyphOptions();
-  Canvas.resetPaintOptions();
+  canvas()->setOrigin(srect.X1, srect.Y1);
+  canvas()->setClippingRect( clippingRect.intersection(paintEvent->params.rect) );
+  canvas()->resetGlyphOptions();
+  canvas()->resetPaintOptions();
 }
 
 
@@ -1257,7 +1456,7 @@ void uiWindow::processEvent(uiEvent * event)
 
     case UIEVT_MOUSEENTER:
       m_isMouseOver = true;
-      VGAController.setMouseCursor(m_windowStyle.defaultCursor);
+      app()->displayController()->setMouseCursor(m_windowStyle.defaultCursor);
       break;
 
     case UIEVT_MOUSELEAVE:
@@ -1298,9 +1497,9 @@ void uiWindow::paintWindow()
   // border
   int bSize = hasFocus() ? m_windowStyle.focusedBorderSize : m_windowStyle.borderSize;
   if (bSize > 0) {
-    Canvas.setPenColor(hasFocus() ? m_windowStyle.focusedBorderColor : (state().active ? m_windowStyle.activeBorderColor : m_windowStyle.borderColor));
+    canvas()->setPenColor(hasFocus() ? m_windowStyle.focusedBorderColor : (state().active ? m_windowStyle.activeBorderColor : m_windowStyle.borderColor));
     for (int i = 0; i < bSize; ++i)
-      Canvas.drawRectangle(i, i, m_size.width - 1 - i, m_size.height - 1 - i);
+      canvas()->drawRectangle(i, i, m_size.width - 1 - i, m_size.height - 1 - i);
   }
 }
 
@@ -1577,22 +1776,22 @@ void uiFrame::paintFrame()
   if (m_titleLength > 0) {
     int barHeight = titleBarHeight();
     // title bar background
-    RGB titleBarBrushColor = state().active ? m_frameStyle.activeTitleBackgroundColor : m_frameStyle.titleBackgroundColor;
-    Canvas.setBrushColor(titleBarBrushColor);
-    Canvas.fillRectangle(titleBarRect());
+    RGB888 titleBarBrushColor = state().active ? m_frameStyle.activeTitleBackgroundColor : m_frameStyle.titleBackgroundColor;
+    canvas()->setBrushColor(titleBarBrushColor);
+    canvas()->fillRectangle(titleBarRect());
     // close, maximize and minimze buttons
     int btnX = paintButtons(bkgRect);
     // title
-    Canvas.setPenColor(state().active ? m_frameStyle.activeTitleColor : m_frameStyle.titleColor);
-    Canvas.setGlyphOptions(GlyphOptions().FillBackground(false).DoubleWidth(0).Bold(false).Italic(false).Underline(false).Invert(0));
-    Canvas.drawTextWithEllipsis(m_frameStyle.titleFont, 1 + bkgRect.X1, 1 + bkgRect.Y1, m_title, btnX);
+    canvas()->setPenColor(state().active ? m_frameStyle.activeTitleColor : m_frameStyle.titleColor);
+    canvas()->setGlyphOptions(GlyphOptions().FillBackground(false).DoubleWidth(0).Bold(false).Italic(false).Underline(false).Invert(0));
+    canvas()->drawTextWithEllipsis(m_frameStyle.titleFont, 1 + bkgRect.X1, 1 + bkgRect.Y1, m_title, btnX);
     // adjust background rect
     bkgRect.Y1 += barHeight;
   }
   // background
   if (!state().minimized && bkgRect.width() > 0 && bkgRect.height() > 0) {
-    Canvas.setBrushColor(m_frameStyle.backgroundColor);
-    Canvas.fillRectangle(bkgRect);
+    canvas()->setBrushColor(m_frameStyle.backgroundColor);
+    canvas()->fillRectangle(bkgRect);
   }
 }
 
@@ -1606,52 +1805,52 @@ int uiFrame::paintButtons(Rect const & bkgRect)
     Rect r = getBtnRect(0);
     buttonsX = r.X1;
     if (m_mouseMoveFrameItem == uiFrameItem::CloseButton) {
-      Canvas.setBrushColor(m_frameStyle.mouseOverBackgroundButtonColor);
-      Canvas.fillRectangle(r);
-      Canvas.setPenColor(m_frameStyle.mouseOverButtonColor);
+      canvas()->setBrushColor(m_frameStyle.mouseOverBackgroundButtonColor);
+      canvas()->fillRectangle(r);
+      canvas()->setPenColor(m_frameStyle.mouseOverButtonColor);
     } else
-      Canvas.setPenColor(state().active ? m_frameStyle.activeButtonColor : m_frameStyle.buttonColor);
+      canvas()->setPenColor(state().active ? m_frameStyle.activeButtonColor : m_frameStyle.buttonColor);
     r = r.shrink(4);
-    Canvas.drawLine(r.X1, r.Y1, r.X2, r.Y2);
-    Canvas.drawLine(r.X2, r.Y1, r.X1, r.Y2);
+    canvas()->drawLine(r.X1, r.Y1, r.X2, r.Y2);
+    canvas()->drawLine(r.X2, r.Y1, r.X1, r.Y2);
   }
   if (m_frameProps.hasMaximizeButton) {
     // maximize/restore button
     Rect r = getBtnRect(1);
     buttonsX = r.X1;
     if (m_mouseMoveFrameItem == uiFrameItem::MaximizeButton) {
-      Canvas.setBrushColor(m_frameStyle.mouseOverBackgroundButtonColor);
-      Canvas.fillRectangle(r);
-      Canvas.setPenColor(m_frameStyle.mouseOverButtonColor);
+      canvas()->setBrushColor(m_frameStyle.mouseOverBackgroundButtonColor);
+      canvas()->fillRectangle(r);
+      canvas()->setPenColor(m_frameStyle.mouseOverButtonColor);
     } else
-      Canvas.setPenColor(state().active ? m_frameStyle.activeButtonColor : m_frameStyle.buttonColor);
+      canvas()->setPenColor(state().active ? m_frameStyle.activeButtonColor : m_frameStyle.buttonColor);
     r = r.shrink(4);
     if (state().maximized || state().minimized) {
       // draw restore (from maximize or minimize) button
       r = r.shrink(1).translate(-1, +1);
-      Canvas.drawRectangle(r);
+      canvas()->drawRectangle(r);
       r = r.translate(+2, -2);
-      Canvas.moveTo(r.X1, r.Y1 + 2);
-      Canvas.lineTo(r.X1, r.Y1);
-      Canvas.lineTo(r.X2, r.Y1);
-      Canvas.lineTo(r.X2, r.Y2);
-      Canvas.lineTo(r.X2 - 2, r.Y2);
+      canvas()->moveTo(r.X1, r.Y1 + 2);
+      canvas()->lineTo(r.X1, r.Y1);
+      canvas()->lineTo(r.X2, r.Y1);
+      canvas()->lineTo(r.X2, r.Y2);
+      canvas()->lineTo(r.X2 - 2, r.Y2);
     } else
-      Canvas.drawRectangle(r);
+      canvas()->drawRectangle(r);
   }
   if (m_frameProps.hasMinimizeButton && !state().minimized) {
     // minimize button
     Rect r = getBtnRect(2);
     buttonsX = r.X1;
     if (m_mouseMoveFrameItem == uiFrameItem::MinimizeButton) {
-      Canvas.setBrushColor(m_frameStyle.mouseOverBackgroundButtonColor);
-      Canvas.fillRectangle(r);
-      Canvas.setPenColor(m_frameStyle.mouseOverButtonColor);
+      canvas()->setBrushColor(m_frameStyle.mouseOverBackgroundButtonColor);
+      canvas()->fillRectangle(r);
+      canvas()->setPenColor(m_frameStyle.mouseOverButtonColor);
     } else
-      Canvas.setPenColor(state().active ? m_frameStyle.activeButtonColor : m_frameStyle.buttonColor);
+      canvas()->setPenColor(state().active ? m_frameStyle.activeButtonColor : m_frameStyle.buttonColor);
     r = r.shrink(4);
     int h = (r.Y2 - r.Y1 + 1) / 2;
-    Canvas.drawLine(r.X1, r.Y1 + h, r.X2, r.Y1 + h);
+    canvas()->drawLine(r.X1, r.Y1 + h, r.X2, r.Y1 + h);
   }
   return buttonsX;
 }
@@ -1666,6 +1865,7 @@ void uiFrame::processEvent(uiEvent * event)
     case UIEVT_PAINT:
       beginPaint(event, uiWindow::clientRect(uiOrigin::Window));
       paintFrame();
+      onPaint();
       break;
 
     case UIEVT_MOUSEBUTTONDOWN:
@@ -1728,6 +1928,14 @@ void uiFrame::processEvent(uiEvent * event)
 
     case UIEVT_TIMER:
       onTimer(event->params.timerHandle);
+      break;
+
+    case UIEVT_KEYDOWN:
+      onKeyDown(event->params.key);
+      break;
+
+    case UIEVT_KEYUP:
+      onKeyUp(event->params.key);
       break;
 
     default:
@@ -1887,22 +2095,22 @@ void uiFrame::movingCapturedMouse(int mouseX, int mouseY, bool mouseIsDown)
 void uiFrame::drawReshapingBox(Rect boxRect)
 {
   int clientOffsetY = clientRect(uiOrigin::Window).Y1;
-  Canvas.setOrigin(parent()->rect(uiOrigin::Screen).pos());
-  Canvas.setClippingRect(parent()->clientRect(uiOrigin::Window));
+  canvas()->setOrigin(parent()->rect(uiOrigin::Screen).pos());
+  canvas()->setClippingRect(parent()->clientRect(uiOrigin::Window));
   PaintOptions popt;
   popt.NOT = true;
-  Canvas.setPaintOptions(popt);
+  canvas()->setPaintOptions(popt);
   if (m_lastReshapingBox != Rect()) {
-    Canvas.drawRectangle(m_lastReshapingBox);
+    canvas()->drawRectangle(m_lastReshapingBox);
     if (m_titleLength > 0)
-      Canvas.drawLine(m_lastReshapingBox.X1, m_lastReshapingBox.Y1 + clientOffsetY, m_lastReshapingBox.X2, m_lastReshapingBox.Y1 + clientOffsetY);
+      canvas()->drawLine(m_lastReshapingBox.X1, m_lastReshapingBox.Y1 + clientOffsetY, m_lastReshapingBox.X2, m_lastReshapingBox.Y1 + clientOffsetY);
   }
   if (boxRect != Rect()) {
-    Canvas.drawRectangle(boxRect);
+    canvas()->drawRectangle(boxRect);
     if (m_titleLength > 0)
-      Canvas.drawLine(boxRect.X1, boxRect.Y1 + clientOffsetY, boxRect.X2, boxRect.Y1 + clientOffsetY);
+      canvas()->drawLine(boxRect.X1, boxRect.Y1 + clientOffsetY, boxRect.X2, boxRect.Y1 + clientOffsetY);
   }
-  Canvas.setPaintOptions(PaintOptions());
+  canvas()->setPaintOptions(PaintOptions());
   m_lastReshapingBox = boxRect;
 }
 
@@ -1962,7 +2170,7 @@ void uiFrame::movingFreeMouse(int mouseX, int mouseY)
       break;
   }
 
-  VGAController.setMouseCursor(cur);
+  app()->displayController()->setMouseCursor(cur);
 }
 
 
@@ -2040,8 +2248,8 @@ uiButton::uiButton(uiWindow * parent, char const * text, const Point & pos, cons
 
   windowStyle().borderSize         = 1;
   windowStyle().focusedBorderSize  = 2;
-  windowStyle().borderColor        = RGB(1, 1, 1);
-  windowStyle().focusedBorderColor = RGB(0, 0, 3);
+  windowStyle().borderColor        = RGB888(64, 64, 64);
+  windowStyle().focusedBorderColor = RGB888(0, 0, 255);
 
   setText(text);
 }
@@ -2059,7 +2267,7 @@ void uiButton::setText(char const * value)
   m_text = (char*) realloc(m_text, len + 1);
   strcpy(m_text, value);
 
-  m_textExtent = Canvas.textExtent(m_buttonStyle.textFont, value);
+  m_textExtent = canvas()->textExtent(m_buttonStyle.textFont, value);
 }
 
 
@@ -2067,13 +2275,13 @@ void uiButton::paintButton()
 {
   Rect bkgRect = uiControl::clientRect(uiOrigin::Window);
   // background
-  RGB bkColor = m_down ? m_buttonStyle.downBackgroundColor : m_buttonStyle.backgroundColor;
+  RGB888 bkColor = m_down ? m_buttonStyle.downBackgroundColor : m_buttonStyle.backgroundColor;
   if (app()->capturedMouseWindow() == this)
     bkColor = m_buttonStyle.mouseDownBackgroundColor;
   else if (isMouseOver())
     bkColor = m_buttonStyle.mouseOverBackgroundColor;
-  Canvas.setBrushColor(bkColor);
-  Canvas.fillRectangle(bkgRect);
+  canvas()->setBrushColor(bkColor);
+  canvas()->fillRectangle(bkgRect);
   // content (text and bitmap)
   paintContent(bkgRect);
 }
@@ -2091,13 +2299,13 @@ void uiButton::paintContent(Rect const & rect)
   int y = rect.Y1 + (rect.size().height - imax(textHeight, bitmapHeight)) / 2;
 
   if (bitmap) {
-    Canvas.drawBitmap(x, y, bitmap);
+    canvas()->drawBitmap(x, y, bitmap);
     x += bitmapWidth + bitmapTextSpace;
     y += (imax(textHeight, bitmapHeight) - textHeight) / 2;
   }
-  Canvas.setGlyphOptions(GlyphOptions().FillBackground(false).DoubleWidth(0).Bold(false).Italic(false).Underline(false).Invert(0));
-  Canvas.setPenColor(m_buttonStyle.textColor);
-  Canvas.drawText(m_buttonStyle.textFont, x, y, m_text);
+  canvas()->setGlyphOptions(GlyphOptions().FillBackground(false).DoubleWidth(0).Bold(false).Italic(false).Underline(false).Invert(0));
+  canvas()->setPenColor(m_buttonStyle.textColor);
+  canvas()->drawText(m_buttonStyle.textFont, x, y, m_text);
 }
 
 
@@ -2187,7 +2395,7 @@ uiTextEdit::uiTextEdit(uiWindow * parent, char const * text, const Point & pos, 
   windowProps().focusable = true;
 
   windowStyle().defaultCursor = CursorName::CursorTextInput;
-  windowStyle().borderColor   = RGB(1, 1, 1);
+  windowStyle().borderColor   = RGB888(64, 64, 64);
   windowStyle().borderSize    = 1;
 
   setText(text);
@@ -2298,7 +2506,7 @@ void uiTextEdit::handleKeyDown(uiKeyEventInfo key)
       default:
       {
         // normal keys
-        int c = Keyboard.virtualKeyToASCII(key.VK);
+        int c = app()->keyboard()->virtualKeyToASCII(key.VK);
         if (c >= 0x20 && c != 0x7F) {
           if (m_cursorCol != m_selCursorCol)
             removeSel();  // there is a selection, same behavior of VK_DELETE
@@ -2378,9 +2586,9 @@ void uiTextEdit::paintTextEdit()
 {
   m_contentRect = getEditRect();
   // background
-  RGB bkColor = hasFocus() ? m_textEditStyle.focusedBackgroundColor : (isMouseOver() ? m_textEditStyle.mouseOverBackgroundColor : m_textEditStyle.backgroundColor);
-  Canvas.setBrushColor(bkColor);
-  Canvas.fillRectangle(m_contentRect);
+  RGB888 bkColor = hasFocus() ? m_textEditStyle.focusedBackgroundColor : (isMouseOver() ? m_textEditStyle.mouseOverBackgroundColor : m_textEditStyle.backgroundColor);
+  canvas()->setBrushColor(bkColor);
+  canvas()->fillRectangle(m_contentRect);
   // content
   paintContent();
 }
@@ -2407,22 +2615,22 @@ uint8_t const * uiTextEdit::getCharInfo(char ch, int * width)
 void uiTextEdit::paintContent()
 {
   m_contentRect = m_contentRect.shrink(2);
-  Canvas.setClippingRect(Canvas.getClippingRect().intersection(m_contentRect));
-  Canvas.setPenColor(m_textEditStyle.textColor);
+  canvas()->setClippingRect(canvas()->getClippingRect().intersection(m_contentRect));
+  canvas()->setPenColor(m_textEditStyle.textColor);
 
   GlyphOptions glyphOpt = GlyphOptions().FillBackground(false).DoubleWidth(0).Bold(false).Italic(false).Underline(false).Invert(0);
   if (m_selCursorCol != m_cursorCol)
     glyphOpt.FillBackground(true);
-  Canvas.setGlyphOptions(glyphOpt);
+  canvas()->setGlyphOptions(glyphOpt);
 
   for (int x = m_contentRect.X1 + m_viewX, y = m_contentRect.Y1, col = 0, fontWidth; m_text[col]; ++col, x += fontWidth) {
     uint8_t const * chptr = getCharInfo(m_text[col], &fontWidth);
     if (m_selCursorCol != m_cursorCol && (col == m_selCursorCol || col == m_cursorCol)) {
       glyphOpt.invert = !glyphOpt.invert;
-      Canvas.setGlyphOptions(glyphOpt);
+      canvas()->setGlyphOptions(glyphOpt);
     }
     if (x >= m_contentRect.X1 && x <= m_contentRect.X2)
-      Canvas.drawGlyph(x, y, fontWidth, m_textEditStyle.textFont->height, chptr, 0);
+      canvas()->drawGlyph(x, y, fontWidth, m_textEditStyle.textFont->height, chptr, 0);
   }
 }
 
@@ -2655,7 +2863,7 @@ void uiLabel::setTextFmt(const char *format, ...)
 
 void uiLabel::update()
 {
-  m_textExtent = Canvas.textExtent(m_labelStyle.textFont, m_text);
+  m_textExtent = canvas()->textExtent(m_labelStyle.textFont, m_text);
   if (m_autoSize)
     app()->resizeWindow(this, m_textExtent, m_labelStyle.textFont->height);
   repaint();
@@ -2665,13 +2873,13 @@ void uiLabel::update()
 void uiLabel::paintLabel()
 {
   Rect r = uiControl::clientRect(uiOrigin::Window);
-  Canvas.setBrushColor(m_labelStyle.backgroundColor);
-  Canvas.fillRectangle(r);
-  Canvas.setGlyphOptions(GlyphOptions().FillBackground(false).DoubleWidth(0).Bold(false).Italic(false).Underline(false).Invert(0));
-  Canvas.setPenColor(m_labelStyle.textColor);
+  canvas()->setBrushColor(m_labelStyle.backgroundColor);
+  canvas()->fillRectangle(r);
+  canvas()->setGlyphOptions(GlyphOptions().FillBackground(false).DoubleWidth(0).Bold(false).Italic(false).Underline(false).Invert(0));
+  canvas()->setPenColor(m_labelStyle.textColor);
   int x = r.X1;
   int y = r.Y1 + (r.height() - m_labelStyle.textFont->height) / 2;
-  Canvas.drawText(m_labelStyle.textFont, x, y, m_text);
+  canvas()->drawText(m_labelStyle.textFont, x, y, m_text);
 }
 
 
@@ -2733,12 +2941,12 @@ void uiImage::setBitmap(Bitmap const * bitmap)
 void uiImage::paintImage()
 {
   Rect r = uiControl::clientRect(uiOrigin::Window);
-  Canvas.setBrushColor(m_imageStyle.backgroundColor);
-  Canvas.fillRectangle(r);
+  canvas()->setBrushColor(m_imageStyle.backgroundColor);
+  canvas()->fillRectangle(r);
   if (m_bitmap) {
     int x = r.X1 + (r.X2 + 1 - m_bitmap->width) / 2;
     int y = r.Y1 + (r.Y2 + 1 - m_bitmap->height) / 2;
-    Canvas.drawBitmap(x, y, m_bitmap);
+    canvas()->drawBitmap(x, y, m_bitmap);
   }
 }
 
@@ -2776,7 +2984,7 @@ uiPanel::uiPanel(uiWindow * parent, const Point & pos, const Size & size, bool v
 
   windowProps().focusable = false;
   windowStyle().borderSize = 1;
-  windowStyle().borderColor = RGB(1, 1, 1);
+  windowStyle().borderColor = RGB888(64, 64, 64);
 }
 
 
@@ -2789,8 +2997,8 @@ void uiPanel::paintPanel()
 {
   Rect bkgRect = uiControl::clientRect(uiOrigin::Window);
   // background
-  Canvas.setBrushColor(m_panelStyle.backgroundColor);
-  Canvas.fillRectangle(bkgRect);
+  canvas()->setBrushColor(m_panelStyle.backgroundColor);
+  canvas()->fillRectangle(bkgRect);
 }
 
 
@@ -2827,7 +3035,7 @@ uiPaintBox::uiPaintBox(uiWindow * parent, const Point & pos, const Size & size, 
 
   windowProps().focusable = false;
   windowStyle().borderSize  = 1;
-  windowStyle().borderColor = RGB(1, 1, 1);
+  windowStyle().borderColor = RGB888(64, 64, 64);
 }
 
 
@@ -2841,8 +3049,8 @@ void uiPaintBox::paintPaintBox()
   Rect bkgRect = uiScrollableControl::clientRect(uiOrigin::Window);
 
   // background
-  Canvas.setBrushColor(m_paintBoxStyle.backgroundColor);
-  Canvas.fillRectangle(bkgRect);
+  canvas()->setBrushColor(m_paintBoxStyle.backgroundColor);
+  canvas()->fillRectangle(bkgRect);
 
   onPaint(bkgRect);
 }
@@ -3146,54 +3354,54 @@ Rect uiScrollableControl::getHScrollBarRects(Rect * leftButton, Rect * rightButt
 
 void uiScrollableControl::paintScrollableControl()
 {
-  RGB FColor          = m_scrollableControlStyle.scrollBarForegroundColor;
-  RGB mouseOverFColor = m_scrollableControlStyle.mouseOverScrollBarForegroundColor;
+  RGB888 FColor          = m_scrollableControlStyle.scrollBarForegroundColor;
+  RGB888 mouseOverFColor = m_scrollableControlStyle.mouseOverScrollBarForegroundColor;
   if (m_HScrollBarRange) {
     //// paint horizontal scroll bar (at bottom side of the window)
     Rect lbtn, rbtn, bar;
     Rect box = getHScrollBarRects(&lbtn, &rbtn, &bar);
     // background
-    Canvas.setBrushColor(m_scrollableControlStyle.scrollBarBackgroundColor);
-    Canvas.setPenColor(m_scrollableControlStyle.scrollBarBackgroundColor);
-    Canvas.fillRectangle(Rect(box.X1, box.Y1, bar.X1 - 1, box.Y2)); // left part
-    Canvas.fillRectangle(Rect(bar.X2 + 1, box.Y1, box.X2, box.Y2)); // right part
-    Canvas.drawLine(bar.X1, box.Y1, bar.X2, box.Y1);  // fill line above the bar
-    Canvas.drawLine(bar.X1, box.Y2, bar.X2, box.Y2);  // fill line below the bar
+    canvas()->setBrushColor(m_scrollableControlStyle.scrollBarBackgroundColor);
+    canvas()->setPenColor(m_scrollableControlStyle.scrollBarBackgroundColor);
+    canvas()->fillRectangle(Rect(box.X1, box.Y1, bar.X1 - 1, box.Y2)); // left part
+    canvas()->fillRectangle(Rect(bar.X2 + 1, box.Y1, box.X2, box.Y2)); // right part
+    canvas()->drawLine(bar.X1, box.Y1, bar.X2, box.Y1);  // fill line above the bar
+    canvas()->drawLine(bar.X1, box.Y2, bar.X2, box.Y2);  // fill line below the bar
     // buttons (arrows)
-    Canvas.setPenColor(m_mouseOverItem == uiScrollBarItem::LeftButton ? mouseOverFColor : FColor);
-    Canvas.drawLine(lbtn.X2, lbtn.Y1, lbtn.X1, lbtn.Y1 + lbtn.height() / 2);
-    Canvas.drawLine(lbtn.X1, lbtn.Y1 + lbtn.height() / 2, lbtn.X2, lbtn.Y2);
-    Canvas.setPenColor(m_mouseOverItem == uiScrollBarItem::RightButton ? mouseOverFColor : FColor);
-    Canvas.drawLine(rbtn.X1, rbtn.Y1, rbtn.X2, rbtn.Y1 + lbtn.height() / 2);
-    Canvas.drawLine(rbtn.X2, rbtn.Y1 + lbtn.height() / 2, rbtn.X1, rbtn.Y2);
+    canvas()->setPenColor(m_mouseOverItem == uiScrollBarItem::LeftButton ? mouseOverFColor : FColor);
+    canvas()->drawLine(lbtn.X2, lbtn.Y1, lbtn.X1, lbtn.Y1 + lbtn.height() / 2);
+    canvas()->drawLine(lbtn.X1, lbtn.Y1 + lbtn.height() / 2, lbtn.X2, lbtn.Y2);
+    canvas()->setPenColor(m_mouseOverItem == uiScrollBarItem::RightButton ? mouseOverFColor : FColor);
+    canvas()->drawLine(rbtn.X1, rbtn.Y1, rbtn.X2, rbtn.Y1 + lbtn.height() / 2);
+    canvas()->drawLine(rbtn.X2, rbtn.Y1 + lbtn.height() / 2, rbtn.X1, rbtn.Y2);
     // the bar
-    Canvas.setBrushColor(m_mouseOverItem == uiScrollBarItem::HBar ? mouseOverFColor : FColor);
-    Canvas.fillRectangle(bar);
+    canvas()->setBrushColor(m_mouseOverItem == uiScrollBarItem::HBar ? mouseOverFColor : FColor);
+    canvas()->fillRectangle(bar);
   }
   if (m_VScrollBarRange) {
     // paint vertical scroll bar (at right side of the window)
     Rect ubtn, bbtn, bar;
     Rect box = getVScrollBarRects(&ubtn, &bbtn, &bar);
     // background
-    Canvas.setBrushColor(m_scrollableControlStyle.scrollBarBackgroundColor);
-    Canvas.setPenColor(m_scrollableControlStyle.scrollBarBackgroundColor);
-    Canvas.fillRectangle(Rect(box.X1, box.Y1, box.X2, bar.Y1 - 1)); // upper part
-    Canvas.fillRectangle(Rect(box.X1, bar.Y2 + 1, box.X2, box.Y2)); // bottom part
-    Canvas.drawLine(box.X1, bar.Y1, box.X1, bar.Y2);  // fill line at left of the bar
-    Canvas.drawLine(box.X2, bar.Y1, box.X2, bar.Y2);  // fill line at right of the bar
+    canvas()->setBrushColor(m_scrollableControlStyle.scrollBarBackgroundColor);
+    canvas()->setPenColor(m_scrollableControlStyle.scrollBarBackgroundColor);
+    canvas()->fillRectangle(Rect(box.X1, box.Y1, box.X2, bar.Y1 - 1)); // upper part
+    canvas()->fillRectangle(Rect(box.X1, bar.Y2 + 1, box.X2, box.Y2)); // bottom part
+    canvas()->drawLine(box.X1, bar.Y1, box.X1, bar.Y2);  // fill line at left of the bar
+    canvas()->drawLine(box.X2, bar.Y1, box.X2, bar.Y2);  // fill line at right of the bar
     // fill box between scrollbars
     if (m_HScrollBarRange)
-      Canvas.fillRectangle(Rect(box.X1, box.Y2 + 1, box.X2, box.Y2 + m_scrollableControlStyle.scrollBarSize));
+      canvas()->fillRectangle(Rect(box.X1, box.Y2 + 1, box.X2, box.Y2 + m_scrollableControlStyle.scrollBarSize));
     // buttons (arrows)
-    Canvas.setPenColor(m_mouseOverItem == uiScrollBarItem::TopButton ? mouseOverFColor : FColor);
-    Canvas.drawLine(ubtn.X1, ubtn.Y2, ubtn.X1 + ubtn.width() / 2, ubtn.Y1);
-    Canvas.drawLine(ubtn.X1 + ubtn.width() / 2, ubtn.Y1, ubtn.X2, ubtn.Y2);
-    Canvas.setPenColor(m_mouseOverItem == uiScrollBarItem::BottomButton ? mouseOverFColor : FColor);
-    Canvas.drawLine(bbtn.X1, bbtn.Y1, bbtn.X1 + bbtn.width() / 2, bbtn.Y2);
-    Canvas.drawLine(bbtn.X1 + bbtn.width() / 2, bbtn.Y2, bbtn.X2, bbtn.Y1);
+    canvas()->setPenColor(m_mouseOverItem == uiScrollBarItem::TopButton ? mouseOverFColor : FColor);
+    canvas()->drawLine(ubtn.X1, ubtn.Y2, ubtn.X1 + ubtn.width() / 2, ubtn.Y1);
+    canvas()->drawLine(ubtn.X1 + ubtn.width() / 2, ubtn.Y1, ubtn.X2, ubtn.Y2);
+    canvas()->setPenColor(m_mouseOverItem == uiScrollBarItem::BottomButton ? mouseOverFColor : FColor);
+    canvas()->drawLine(bbtn.X1, bbtn.Y1, bbtn.X1 + bbtn.width() / 2, bbtn.Y2);
+    canvas()->drawLine(bbtn.X1 + bbtn.width() / 2, bbtn.Y2, bbtn.X2, bbtn.Y1);
     // the bar
-    Canvas.setBrushColor(m_mouseOverItem == uiScrollBarItem::VBar ? mouseOverFColor : FColor);
-    Canvas.fillRectangle(bar);
+    canvas()->setBrushColor(m_mouseOverItem == uiScrollBarItem::VBar ? mouseOverFColor : FColor);
+    canvas()->fillRectangle(bar);
   }
 }
 
@@ -3214,28 +3422,28 @@ Rect uiScrollableControl::clientRect(uiOrigin origin)
 
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-// uiListBox
+// uiCustomListBox
 
 
-uiListBox::uiListBox(uiWindow * parent, const Point & pos, const Size & size, bool visible)
+uiCustomListBox::uiCustomListBox(uiWindow * parent, const Point & pos, const Size & size, bool visible)
   : uiScrollableControl(parent, pos, size, visible),
     m_firstVisibleItem(0)
 {
-  objectType().uiListBox = true;
+  objectType().uiCustomListBox = true;
 
   windowProps().focusable = true;
 
   windowStyle().borderSize  = 1;
-  windowStyle().borderColor = RGB(1, 1, 1);
+  windowStyle().borderColor = RGB888(64, 64, 64);
 }
 
 
-uiListBox::~uiListBox()
+uiCustomListBox::~uiCustomListBox()
 {
 }
 
 
-void uiListBox::processEvent(uiEvent * event)
+void uiCustomListBox::processEvent(uiEvent * event)
 {
   uiScrollableControl::processEvent(event);
 
@@ -3263,13 +3471,17 @@ void uiListBox::processEvent(uiEvent * event)
       onKillFocus();
       break;
 
+    case UIEVT_SHOW:
+      makeItemVisible(firstSelectedItem());
+      break;
+
     default:
       break;
   }
 }
 
 
-void uiListBox::handleKeyDown(uiKeyEventInfo key)
+void uiCustomListBox::handleKeyDown(uiKeyEventInfo key)
 {
   bool shift = key.SHIFT;
   switch (key.VK) {
@@ -3300,7 +3512,7 @@ void uiListBox::handleKeyDown(uiKeyEventInfo key)
 
     case VK_END:
     case VK_KP_END:
-      selectItem(m_items.count() - 1, shift, shift);
+      selectItem(items_getCount() - 1, shift, shift);
       break;
 
     default:
@@ -3309,31 +3521,27 @@ void uiListBox::handleKeyDown(uiKeyEventInfo key)
 }
 
 
-void uiListBox::selectItem(int index, bool add, bool range)
+void uiCustomListBox::selectItem(int index, bool add, bool range)
 {
-  if (m_items.count() > 0) {
-    index = iclamp(index, 0, m_items.count() - 1);
+  if (items_getCount() > 0) {
+    index = iclamp(index, 0, items_getCount() - 1);
     int first = firstSelectedItem();
     if (!add)
-      m_items.deselectAll();
+      items_deselectAll();
     if (range) {
-      if (index <= first)
+      if (index <= first) {
         for (int i = index; i <= first; ++i)
-          m_items.select(i, true);
-      else
+          items_select(i, true);
+      } else {
         for (int i = index; i >= first; --i)
-          m_items.select(i, true);
+          items_select(i, true);
+      }
     } else {
-      m_items.select(index, true);
+      items_select(index, true);
     }
 
     // make sure the selected item is visible
-    if (VScrollBarVisible()) {
-      if (index < m_firstVisibleItem)
-        m_firstVisibleItem = index;
-      else if (index >= m_firstVisibleItem + VScrollBarVisible())
-        m_firstVisibleItem = index - VScrollBarVisible() + 1;
-    }
+    makeItemVisible(index);
 
     onChange();
 
@@ -3342,23 +3550,34 @@ void uiListBox::selectItem(int index, bool add, bool range)
 }
 
 
-void uiListBox::deselectAll()
+void uiCustomListBox::makeItemVisible(int index)
 {
-  m_items.deselectAll();
+  if (VScrollBarVisible()) {
+    if (index < m_firstVisibleItem)
+      m_firstVisibleItem = index;
+    else if (index >= m_firstVisibleItem + VScrollBarVisible())
+      m_firstVisibleItem = index - VScrollBarVisible() + 1;
+  }
+}
+
+
+void uiCustomListBox::deselectAll()
+{
+  items_deselectAll();
   onChange();
   repaint();
 }
 
 
-void uiListBox::paintListBox()
+void uiCustomListBox::paintListBox()
 {
   Rect cliRect = uiScrollableControl::clientRect(uiOrigin::Window);
   Rect itmRect = Rect(cliRect.X1, cliRect.Y1, cliRect.X2, cliRect.Y1 + m_listBoxStyle.itemHeight - 1);
 
   // do we need a vert scrollbar?
-  if (itmRect.height() * m_items.count() > cliRect.height()) {
+  if (itmRect.height() * items_getCount() > cliRect.height()) {
     int visible = cliRect.height() / itmRect.height();
-    int range = m_items.count();
+    int range = items_getCount();
     if (!VScrollBarVisible() || visible != VScrollBarVisible() || range != VScrollBarRange() || m_firstVisibleItem != VScrollBarPos()) {
       // show vertical scrollbar
       setScrollBar(uiOrientation::Vertical, m_firstVisibleItem, visible, range, false);
@@ -3379,18 +3598,16 @@ void uiListBox::paintListBox()
       break;
 
     // background
-    RGB bkColor = hasFocus() ? m_listBoxStyle.focusedBackgroundColor : m_listBoxStyle.backgroundColor;
-    if (index < m_items.count() && m_items.selected(index))
+    RGB888 bkColor = hasFocus() ? m_listBoxStyle.focusedBackgroundColor : m_listBoxStyle.backgroundColor;
+    if (index < items_getCount() && items_selected(index))
       bkColor = (hasFocus() ? m_listBoxStyle.focusedSelectedBackgroundColor : m_listBoxStyle.selectedBackgroundColor);
-    Canvas.setBrushColor(bkColor);
-    Canvas.fillRectangle(itmRect);
+    canvas()->setBrushColor(bkColor);
+    canvas()->fillRectangle(itmRect);
 
-    if (index < m_items.count()) {
+    if (index < items_getCount()) {
       // text
-      Canvas.setPenColor(m_items.selected(index) ? m_listBoxStyle.selectedTextColor : m_listBoxStyle.textColor);
-      int x = itmRect.X1 + 1;
-      int y = itmRect.Y1 + (itmRect.height() - m_listBoxStyle.textFont->height) / 2;
-      Canvas.drawText(m_listBoxStyle.textFont, x, y, m_items.get(index));
+      canvas()->setPenColor(items_selected(index) ? m_listBoxStyle.selectedTextColor : m_listBoxStyle.textColor);
+      items_draw(index, itmRect);
     }
 
     // move to next item
@@ -3402,26 +3619,26 @@ void uiListBox::paintListBox()
 
 
 // get first selected item (-1 = no selected item)
-int uiListBox::firstSelectedItem()
+int uiCustomListBox::firstSelectedItem()
 {
-  for (int i = 0; i < m_items.count(); ++i)
-    if (m_items.selected(i))
+  for (int i = 0; i < items_getCount(); ++i)
+    if (items_selected(i))
       return i;
   return -1;
 }
 
 
 // get last selected item (-1 = no selected item)
-int uiListBox::lastSelectedItem()
+int uiCustomListBox::lastSelectedItem()
 {
-  for (int i = m_items.count() - 1; i >= 0; --i)
-    if (m_items.selected(i))
+  for (int i = items_getCount() - 1; i >= 0; --i)
+    if (items_selected(i))
       return i;
   return -1;
 }
 
 
-void uiListBox::setScrollBar(uiOrientation orientation, int position, int visible, int range, bool repaintScrollbar)
+void uiCustomListBox::setScrollBar(uiOrientation orientation, int position, int visible, int range, bool repaintScrollbar)
 {
   uiScrollableControl::setScrollBar(orientation, position, visible, range, false);
   if (VScrollBarVisible() && m_firstVisibleItem != VScrollBarPos()) {
@@ -3431,35 +3648,172 @@ void uiListBox::setScrollBar(uiOrientation orientation, int position, int visibl
 }
 
 
-int uiListBox::getItemAtMousePos(int mouseX, int mouseY)
+int uiCustomListBox::getItemAtMousePos(int mouseX, int mouseY)
 {
   Rect cliRect = uiScrollableControl::clientRect(uiOrigin::Window);
-  if (cliRect.contains(mouseX, mouseY))
-    return m_firstVisibleItem + (mouseY - cliRect.Y1) / m_listBoxStyle.itemHeight;
+  if (cliRect.contains(mouseX, mouseY)) {
+    int idx = m_firstVisibleItem + (mouseY - cliRect.Y1) / m_listBoxStyle.itemHeight;
+    if (idx < items_getCount())
+      return idx;
+  }
   return -1;
 }
 
 
-void uiListBox::handleMouseDown(int mouseX, int mouseY)
+void uiCustomListBox::handleMouseDown(int mouseX, int mouseY)
 {
   int idx = getItemAtMousePos(mouseX, mouseY);
   if (idx > -1) {
-    if (Keyboard.isVKDown(VK_LCTRL) || Keyboard.isVKDown(VK_RCTRL)) {
+    if (app()->keyboard()->isVKDown(VK_LCTRL) || app()->keyboard()->isVKDown(VK_RCTRL)) {
       // CTRL is down
-      m_items.select(idx, !m_items.selected(idx));
+      items_select(idx, !items_selected(idx));
     } else {
       // CTRL is up
-      m_items.deselectAll();
-      m_items.select(idx, true);
+      items_deselectAll();
+      items_select(idx, true);
     }
-    onChange();
-    repaint();
-  }
+  } else
+    items_deselectAll();
+  onChange();
+  repaint();
 }
+
+
+// uiCustomListBox
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// uiListBox
+
+
+uiListBox::uiListBox(uiWindow * parent, const Point & pos, const Size & size, bool visible)
+  : uiCustomListBox(parent, pos, size, visible)
+{
+  objectType().uiListBox = true;
+}
+
+
+void uiListBox::items_draw(int index, const Rect & itemRect)
+{
+  int x = itemRect.X1 + 1;
+  int y = itemRect.Y1 + (itemRect.height() - listBoxStyle().textFont->height) / 2;
+  canvas()->drawText(listBoxStyle().textFont, x, y, m_items.get(index));
+}
+
 
 // uiListBox
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// uiFileBrowser
+
+
+uiFileBrowser::uiFileBrowser(uiWindow * parent, const Point & pos, const Size & size, bool visible)
+  : uiCustomListBox(parent, pos, size, visible),
+    m_selected(-1)
+{
+  objectType().uiFileBrowser = true;
+}
+
+
+void uiFileBrowser::items_draw(int index, const Rect & itemRect)
+{
+  int x = itemRect.X1 + 1;
+  int y = itemRect.Y1 + (itemRect.height() - listBoxStyle().textFont->height) / 2;
+  canvas()->drawText(listBoxStyle().textFont, x, y, m_dir.get(index)->name);
+  if (m_dir.get(index)->isDir) {
+    static const char * DIRTXT = "[dir]";
+    int x = itemRect.X2 - canvas()->textExtent(listBoxStyle().textFont, DIRTXT);
+    canvas()->drawText(listBoxStyle().textFont, x, y, DIRTXT);
+  }
+}
+
+
+void uiFileBrowser::items_select(int index, bool select)
+{
+  if (select)
+    m_selected = index;
+  else if (index == m_selected || index == -1)
+    m_selected = -1;
+}
+
+
+void uiFileBrowser::setDirectory(char const * path)
+{
+  m_dir.setDirectory(path);
+  m_selected = m_dir.count() > 0 ? 0 : -1;
+  repaint();
+}
+
+
+char const * uiFileBrowser::filename()
+{
+  return m_selected >= 0 ? m_dir.get(m_selected)->name : nullptr;
+}
+
+
+bool uiFileBrowser::isDirectory()
+{
+  return m_selected >= 0 ? m_dir.get(m_selected)->isDir : false;
+}
+
+
+void uiFileBrowser::enterSubDir()
+{
+  if (m_selected >= 0) {
+    auto selItem = m_dir.get(m_selected);
+    if (selItem->isDir) {
+      m_dir.changeDirectory(selItem->name);
+      m_selected = 0;
+      onChange();
+      repaint();
+    }
+  }
+}
+
+
+void uiFileBrowser::update()
+{
+  m_dir.reload();
+  m_selected = imin(m_dir.count() - 1, m_selected);
+  onChange();
+  repaint();
+}
+
+
+void uiFileBrowser::processEvent(uiEvent * event)
+{
+  uiCustomListBox::processEvent(event);
+
+  switch (event->id) {
+
+    case UIEVT_KEYDOWN:
+      if (event->params.key.VK == VK_RETURN)
+        enterSubDir();
+      else if (event->params.key.VK == VK_BACKSPACE) {
+        // backspace moves to parent dir
+        m_selected = 0; // select ".."
+        enterSubDir();
+      }
+      break;
+
+    case UIEVT_KEYUP:
+      break;
+
+    case UIEVT_DBLCLICK:
+      enterSubDir();
+      break;
+
+    default:
+      break;
+  }
+}
+
+
+// uiFileBrowser
+////////////////////////////////////////////////////////////////////////////////////////////////////
 
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -3468,7 +3822,7 @@ void uiListBox::handleMouseDown(int mouseX, int mouseY)
 
 uiComboBox::uiComboBox(uiWindow * parent, const Point & pos, const Size & size, int listHeight, bool visible)
   : uiTextEdit(parent, "", pos, size, visible),
-    m_listBox(parent, Point(0, 0), Size(0, 0), false),
+    m_listBox(new uiListBox(parent, Point(0, 0), Size(0, 0), false)),
     m_listHeight(listHeight)
 {
   objectType().uiComboBox = true;
@@ -3476,16 +3830,16 @@ uiComboBox::uiComboBox(uiWindow * parent, const Point & pos, const Size & size, 
   textEditProps().hasCaret  = false;
   textEditProps().allowEdit = false;
 
-  m_listBox.onKillFocus = [&]() {
+  m_listBox->onKillFocus = [&]() {
     closeListBox();
   };
 
-  m_listBox.onChange = [&]() {
+  m_listBox->onChange = [&]() {
     updateTextEdit();
     onChange();
   };
 
-  m_listBox.onKeyUp = [&](uiKeyEventInfo key) {
+  m_listBox->onKeyUp = [&](uiKeyEventInfo key) {
     if (key.VK == VK_RETURN) {
       closeListBox();
       app()->setFocusedWindow(this);
@@ -3503,9 +3857,9 @@ uiComboBox::~uiComboBox()
 void uiComboBox::selectItem(int index)
 {
   if (index < 0)
-    m_listBox.deselectAll();
+    m_listBox->deselectAll();
   else
-    m_listBox.selectItem(index, true);
+    m_listBox->selectItem(index);
   updateTextEdit();
 }
 
@@ -3536,17 +3890,17 @@ void uiComboBox::processEvent(uiEvent * event)
       break;
 
     case UIEVT_SETFOCUS:
-      if (m_comboBoxProps.openOnFocus && event->params.oldFocused != &m_listBox)
+      if (m_comboBoxProps.openOnFocus && event->params.oldFocused != m_listBox)
         openListBox();
       break;
 
     case UIEVT_KILLFOCUS:
-      if (event->params.newFocused != &m_listBox)
+      if (event->params.newFocused != m_listBox)
         closeListBox();
       break;
 
     case UIEVT_KEYDOWN:
-      m_listBox.processEvent(event);
+      m_listBox->processEvent(event);
       break;
 
     case UIEVT_KEYUP:
@@ -3566,22 +3920,22 @@ void uiComboBox::openListBox()
   Rect r = rect(uiOrigin::Parent);
   r.Y1 = r.Y2 + 1;
   r.Y2 = r.Y1 + m_listHeight;
-  m_listBox.bringOnTop();
-  app()->reshapeWindow(&m_listBox, r);
-  app()->showWindow(&m_listBox, true);
-  app()->setFocusedWindow(&m_listBox);
+  m_listBox->bringOnTop();
+  app()->reshapeWindow(m_listBox, r);
+  app()->showWindow(m_listBox, true);
+  app()->setFocusedWindow(m_listBox);
 }
 
 
 void uiComboBox::closeListBox()
 {
-  app()->showWindow(&m_listBox, false);
+  app()->showWindow(m_listBox, false);
 }
 
 
 void uiComboBox::switchListBox()
 {
-  if (m_listBox.state().visible)
+  if (m_listBox->state().visible)
     closeListBox();
   else
     openListBox();
@@ -3615,19 +3969,19 @@ void uiComboBox::paintComboBox()
   Rect btnRect = getButtonRect();
 
   // button background
-  Canvas.setBrushColor(m_comboBoxStyle.buttonBackgroundColor);
-  Canvas.fillRectangle(btnRect);
+  canvas()->setBrushColor(m_comboBoxStyle.buttonBackgroundColor);
+  canvas()->fillRectangle(btnRect);
 
   // button glyph
-  Canvas.setPenColor(m_comboBoxStyle.buttonColor);
+  canvas()->setPenColor(m_comboBoxStyle.buttonColor);
   Rect arrowRect = btnRect.hShrink(1).vShrink(2);
   int hHeight = arrowRect.height() / 2;
   int hWidth  = arrowRect.width() / 2;
   constexpr int vDist = 2;
-  Canvas.drawLine(arrowRect.X1, arrowRect.Y1 + hHeight - vDist, arrowRect.X1 + hWidth, arrowRect.Y1);
-  Canvas.drawLine(arrowRect.X1 + hWidth, arrowRect.Y1, arrowRect.X2, arrowRect.Y1 + hHeight - vDist);
-  Canvas.drawLine(arrowRect.X1, arrowRect.Y1 + hHeight + vDist, arrowRect.X1 + hWidth, arrowRect.Y2);
-  Canvas.drawLine(arrowRect.X1 + hWidth, arrowRect.Y2, arrowRect.X2, arrowRect.Y1 + hHeight + vDist);
+  canvas()->drawLine(arrowRect.X1, arrowRect.Y1 + hHeight - vDist, arrowRect.X1 + hWidth, arrowRect.Y1);
+  canvas()->drawLine(arrowRect.X1 + hWidth, arrowRect.Y1, arrowRect.X2, arrowRect.Y1 + hHeight - vDist);
+  canvas()->drawLine(arrowRect.X1, arrowRect.Y1 + hHeight + vDist, arrowRect.X1 + hWidth, arrowRect.Y2);
+  canvas()->drawLine(arrowRect.X1 + hWidth, arrowRect.Y2, arrowRect.X2, arrowRect.Y1 + hHeight + vDist);
 }
 
 
@@ -3653,8 +4007,8 @@ uiCheckBox::uiCheckBox(uiWindow * parent, const Point & pos, const Size & size, 
 
   windowStyle().borderSize         = 1;
   windowStyle().focusedBorderSize  = 2;
-  windowStyle().borderColor        = RGB(1, 1, 1);
-  windowStyle().focusedBorderColor = RGB(0, 0, 3);
+  windowStyle().borderColor        = RGB888(64, 64, 64);
+  windowStyle().focusedBorderColor = RGB888(0, 0, 255);
 }
 
 
@@ -3667,23 +4021,23 @@ void uiCheckBox::paintCheckBox()
 {
   Rect bkgRect = uiControl::clientRect(uiOrigin::Window);
   // background
-  RGB bkColor = m_checked ? m_checkBoxStyle.checkedBackgroundColor : m_checkBoxStyle.backgroundColor;
+  RGB888 bkColor = m_checked ? m_checkBoxStyle.checkedBackgroundColor : m_checkBoxStyle.backgroundColor;
   if (isMouseOver())
     bkColor = m_checkBoxStyle.mouseOverBackgroundColor;
-  Canvas.setBrushColor(bkColor);
-  Canvas.fillRectangle(bkgRect);
+  canvas()->setBrushColor(bkColor);
+  canvas()->fillRectangle(bkgRect);
   // content
   if (m_checked) {
     Rect r = rect(uiOrigin::Window).shrink(5);
     switch (m_kind) {
       case uiCheckBoxKind::CheckBox:
-        Canvas.setPenColor(m_checkBoxStyle.foregroundColor);
-        Canvas.drawLine(r.X1, r.Y2 - r.height() / 3, r.X1 + r.width() / 3, r.Y2);
-        Canvas.drawLine(r.X1 + r.width() / 3, r.Y2, r.X2, r.Y1);
+        canvas()->setPenColor(m_checkBoxStyle.foregroundColor);
+        canvas()->drawLine(r.X1, r.Y2 - r.height() / 3, r.X1 + r.width() / 3, r.Y2);
+        canvas()->drawLine(r.X1 + r.width() / 3, r.Y2, r.X2, r.Y1);
         break;
       case uiCheckBoxKind::RadioButton:
-        Canvas.setBrushColor(m_checkBoxStyle.foregroundColor);
-        Canvas.fillEllipse(r.X1 + r.width() / 2 - 1, r.Y1 + r.height() / 2 - 1, r.width(), r.height());
+        canvas()->setBrushColor(m_checkBoxStyle.foregroundColor);
+        canvas()->fillEllipse(r.X1 + r.width() / 2 - 1, r.Y1 + r.height() / 2 - 1, r.width(), r.height());
         break;
     }
   }
@@ -3795,8 +4149,8 @@ uiSlider::uiSlider(uiWindow * parent, const Point & pos, const Size & size, uiOr
   objectType().uiSlider = true;
 
   windowStyle().borderSize         = 1;
-  windowStyle().borderColor        = RGB(3, 3, 3);
-  windowStyle().focusedBorderColor = RGB(0, 0, 3);
+  windowStyle().borderColor        = RGB888(255, 255, 255);
+  windowStyle().focusedBorderColor = RGB888(0, 0, 255);
 
   windowProps().focusable = true;
 }
@@ -3832,46 +4186,46 @@ void uiSlider::paintSlider()
   Rect slideRect = cRect.shrink(4);
   Rect gripRect  = getGripRect();
   // background
-  Canvas.setBrushColor(m_sliderStyle.backgroundColor);
-  Canvas.fillRectangle(cRect);
+  canvas()->setBrushColor(m_sliderStyle.backgroundColor);
+  canvas()->fillRectangle(cRect);
   // slide
-  Canvas.setBrushColor(m_sliderStyle.slideColor);
+  canvas()->setBrushColor(m_sliderStyle.slideColor);
   switch (m_orientation) {
     case uiOrientation::Horizontal:
-      Canvas.fillRectangle(gripRect.X2, slideRect.Y1, slideRect.X2, slideRect.Y2);  // right slide
-      Canvas.setBrushColor(m_sliderStyle.rangeColor);
-      Canvas.fillRectangle(slideRect.X1, slideRect.Y1, gripRect.X1, slideRect.Y2);  // left slide
+      canvas()->fillRectangle(gripRect.X2, slideRect.Y1, slideRect.X2, slideRect.Y2);  // right slide
+      canvas()->setBrushColor(m_sliderStyle.rangeColor);
+      canvas()->fillRectangle(slideRect.X1, slideRect.Y1, gripRect.X1, slideRect.Y2);  // left slide
       break;
     case uiOrientation::Vertical:
-      Canvas.fillRectangle(slideRect.X1, slideRect.Y1, slideRect.X2, gripRect.Y1);  // upper slide
-      Canvas.setBrushColor(m_sliderStyle.rangeColor);
-      Canvas.fillRectangle(slideRect.X1, gripRect.Y2, slideRect.X2, slideRect.Y2);  // bottom slide
+      canvas()->fillRectangle(slideRect.X1, slideRect.Y1, slideRect.X2, gripRect.Y1);  // upper slide
+      canvas()->setBrushColor(m_sliderStyle.rangeColor);
+      canvas()->fillRectangle(slideRect.X1, gripRect.Y2, slideRect.X2, slideRect.Y2);  // bottom slide
       break;
   }
   // ticks
   if (m_ticksFrequency > 0) {
-    Canvas.setPenColor(m_sliderStyle.ticksColor);
+    canvas()->setPenColor(m_sliderStyle.ticksColor);
     int range = m_max - m_min + 0;
     for (int p = m_min; p <= m_max; p += m_ticksFrequency) {
       switch (m_orientation) {
         case uiOrientation::Horizontal:
         {
           int x = slideRect.X1 + slideRect.width() * (p - m_min) / range;
-          Canvas.drawLine(x, slideRect.Y1, x, slideRect.Y2);
+          canvas()->drawLine(x, slideRect.Y1, x, slideRect.Y2);
           break;
         }
         case uiOrientation::Vertical:
         {
           int y = slideRect.Y2 - slideRect.height() * (p - m_min) / range;
-          Canvas.drawLine(slideRect.X1, y, slideRect.X2, y);
+          canvas()->drawLine(slideRect.X1, y, slideRect.X2, y);
           break;
         }
       }
     }
   }
   // grip
-  Canvas.setBrushColor(m_sliderStyle.gripColor);
-  Canvas.fillRectangle(gripRect);
+  canvas()->setBrushColor(m_sliderStyle.gripColor);
+  canvas()->fillRectangle(gripRect);
 }
 
 

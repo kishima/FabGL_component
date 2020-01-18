@@ -27,51 +27,24 @@
 /**
  * @file
  *
- * @brief This file contains fabgl::CanvasClass definition and the related Canvas instance.
+ * @brief This file contains fabgl::Canvas definition.
  */
 
 
 #include <stdint.h>
 #include <stddef.h>
 
-#include "vgacontroller.h"
+#include "displaycontroller.h"
 
 
 namespace fabgl {
 
 
 
-#define FONTINFOFLAGS_ITALIC    1
-#define FONTINFOFLAGS_UNDERLINE 2
-#define FONTINFODLAFS_STRIKEOUT 4
-#define FONTINFOFLAGS_VARWIDTH  8
-
-
-struct FontInfo {
-  uint8_t  pointSize;
-  uint8_t  width;   // used only for fixed width fonts (FONTINFOFLAGS_VARWIDTH = 0)
-  uint8_t  height;
-  uint8_t  ascent;
-  uint8_t  inleading;
-  uint8_t  exleading;
-  uint8_t  flags;
-  uint16_t weight;
-  uint16_t charset;
-  // when FONTINFOFLAGS_VARWIDTH = 0:
-  //   data[] contains 256 items each one representing a single character
-  // when FONTINFOFLAGS_VARWIDTH = 1:
-  //   data[] contains 256 items each one representing a single character. First byte contains the
-  //   character width. "chptr" is filled with an array of pointers to the single characters.
-  uint8_t const *  data;
-  uint32_t const * chptr;  // used only for variable width fonts (FONTINFOFLAGS_VARWIDTH = 1)
-};
-
-
-
 /**
 * @brief A class with a set of drawing methods.
 *
-* This class interfaces directly to the VGA controller and provides
+* This class interfaces directly to the display controller and provides
 * a set of primitives to paint lines, circles, etc. and to scroll regions, copy
 * rectangles and draw glyphs.<br>
 * For default origin is at the top left, starting from (0, 0) up to (Canvas Width - 1, Canvas Height - 1).
@@ -83,17 +56,18 @@ struct FontInfo {
 *     VGAController.setResolution(VGA_640x350_70Hz);
 *
 *     // Paint a green rectangle with red border
-*     Canvas.setPenColor(Color::BrightRed);
-*     Canvas.setBrushColor(Color::BrightGreen);
-*     Canvas.fillRectangle(0, 0, Canvas.getWidth() - 1, Canvas.getHeight() - 1);
-*     Canvas.drawRectangle(0, 0, Canvas.getWidth() - 1, Canvas.getHeight() - 1);
+*     fabgl::Canvas cv(&VGAController);
+*     cv.setPenColor(Color::BrightRed);
+*     cv.setBrushColor(Color::BrightGreen);
+*     cv.fillRectangle(0, 0, cv.getWidth() - 1, cv.getHeight() - 1);
+*     cv.drawRectangle(0, 0, cv.getWidth() - 1, cv.getHeight() - 1);
 *
 */
-class CanvasClass {
+class Canvas {
 
 public:
 
-  CanvasClass();
+  Canvas(DisplayController * displayController);
 
   /**
    * @brief Determines the canvas width in pixels.
@@ -102,7 +76,7 @@ public:
    *
    * @return The canvas width in pixels.
    */
-  int getWidth() { return VGAController.getViewPortWidth(); }
+  int getWidth() { return m_displayController->getViewPortWidth(); }
 
   /**
    * @brief Determines the canvas height in pixels.
@@ -111,7 +85,35 @@ public:
    *
    * @return The canvas height in pixels.
    */
-  int getHeight() { return VGAController.getViewPortHeight(); }
+  int getHeight() { return m_displayController->getViewPortHeight(); }
+
+  /**
+   * @brief Waits for drawing queue to become empty.
+   *
+   * @param waitVSync If true drawings are done on vertical retracing (slow), if false drawings are perfomed immediately (fast with flickering).
+   */
+  void waitCompletion(bool waitVSync = true);
+
+  /**
+   * @brief Suspends drawings.
+   *
+   * After call to beginUpdate() adding new primitives may cause a deadlock.<br>
+   * To avoid this a call to "Canvas.waitCompletion(false)" should be performed very often.
+   */
+  void beginUpdate();
+
+  /**
+   * @brief Resumes drawings after beginUpdate().
+   */
+  void endUpdate();
+
+  /**
+   * @brief Swaps screen buffer when double buffering is enabled.
+   *
+   * Double buffering is enabled calling VGAController.setResolution() with doubleBuffered = true.<br>
+   * Buffers swap is always executed in vertical retracing (at VSync pulse).
+   */
+  void swapBuffers();
 
   /**
    * @brief Sets the axes origin.
@@ -164,7 +166,7 @@ public:
   /**
    * @brief Defines the scrolling region.
    *
-   * A scrolling region is the rectangle area where CanvasClass.scroll() method can operate.
+   * A scrolling region is the rectangle area where Canvas.scroll() method can operate.
    *
    * @param X1 Top left horizontal coordinate.
    * @param Y1 Top left vertical coordiante.
@@ -176,7 +178,7 @@ public:
   /**
    * @brief Scrolls pixels horizontally and/or vertically.
    *
-   * Scrolling occurs inside the scrolling region defined by CanvasClass.setScrollingRegion().<br>
+   * Scrolling occurs inside the scrolling region defined by Canvas.setScrollingRegion().<br>
    * Vertical scroll is done moving line pointers, so it is very fast to perform.<br>
    * Horizontal scroll is done moving pixel by pixel (CPU intensive task).
    *
@@ -211,11 +213,8 @@ public:
    *
    * Example:
    *
-   *     // Set white pen with 8 colors setup
-   *     Canvas.setPenColor(1, 1, 1);
-   *
-   *     // Set white pen with 64 colors setup
-   *     Canvas.setPenColor(3, 3, 3);
+   *     // Set white pen
+   *     Canvas.setPenColor(255, 255, 255);
    */
   void setPenColor(uint8_t red, uint8_t green, uint8_t blue);
 
@@ -234,14 +233,14 @@ public:
   /**
    * @brief Sets pen (foreground) color specifying color components.
    *
-   * @param color Color RGB components.
+   * @param color Color RGB888 components.
    *
    * Example:
    *
    *      // Set white pen
-   *      Canvas.setPenColor(RGB(3, 3, 3));
+   *      Canvas.setPenColor(Color::BrightWhite);
    */
-  void setPenColor(RGB const & color);
+  void setPenColor(RGB888 const & color);
 
   /**
    * @brief Sets brush (background) color specifying color components.
@@ -275,14 +274,14 @@ public:
   /**
    * @brief Sets brush (background) color specifying color components.
    *
-   * @param color The color RGB components.
+   * @param color The color RGB888 components.
    *
    * Example:
    *
    *      // Set blue brush
-   *      Canvas.setBrushColor(RGB(0, 0, 3);
+   *      Canvas.setBrushColor(Color::BrightBlue);
    */
-  void setBrushColor(RGB const & color);
+  void setBrushColor(RGB888 const & color);
 
   /**
    * @brief Fills a single pixel with the pen color.
@@ -299,7 +298,7 @@ public:
    * @param Y Vertical pixel position.
    * @param color Pixe color.
    */
-  void setPixel(int X, int Y, RGB const & color);
+  void setPixel(int X, int Y, RGB888 const & color);
 
   /**
    * @brief Fills a single pixel with the specified color.
@@ -307,13 +306,13 @@ public:
    * @param pos Pixel position.
    * @param color Pixe color.
    */
-  void setPixel(Point const & pos, RGB const & color);
+  void setPixel(Point const & pos, RGB888 const & color);
 
   /**
    * @brief Draws a line starting from current pen position.
    *
-   * Starting pen position is specified using CanvasClass.moveTo() method or
-   * from ending position of the last call to CanvasClass.lineTo().<br>
+   * Starting pen position is specified using Canvas.moveTo() method or
+   * from ending position of the last call to Canvas.lineTo().<br>
    * The line has the current pen color.
    *
    * @param X Horizontal ending line position.
@@ -476,18 +475,11 @@ public:
   void fillEllipse(int X, int Y, int width, int height);
 
   /**
-   * @brief Waits for drawing queue to become empty.
-   *
-   * @param waitVSync If true drawings are done on vertical retracing (slow), if false drawings are perfomed immediately (fast with flickering).
-   */
-  void waitCompletion(bool waitVSync = true);
-
-  /**
    * @brief Draws a glyph at specified position.
    *
    * A Glyph is a monochrome bitmap (1 bit per pixel) that can be painted using pen (foreground) and brush (background) colors.<br>
-   * Various drawing options can be set using CanvasClass.setGlyphOptions() method.<br>
-   * Glyphs are used by TerminalClass to render characters.
+   * Various drawing options can be set using Canvas.setGlyphOptions() method.<br>
+   * Glyphs are used by Terminal to render characters.
    *
    * @param X Horizontal coordinate where to draw the glyph.
    * @param Y Vertical coordinate where to draw the glyph.
@@ -498,9 +490,9 @@ public:
    *
    * Example:
    *
-   *     // draw an 'A' using the predefined font to fit 80x25 screen text
+   *     // draw an 'A' using the predefined 8x8 font
    *     Canvas.setPenColor(Color::BrightGreen);
-   *     const fabgl::FontInfo * f = Canvas.getPresetFontInfo(80, 25);
+   *     const fabgl::FontInfo * f = &fabgl::FONT_8x8;
    *     Canvas.drawGlyph(0, 0, f->width, f->height, f->data, 0x41);
    *
    *     // draw a 12x8 sprite
@@ -519,7 +511,7 @@ public:
    *
    * Setting glyph options allows to slightly change how a glyph is rendered, applying
    * effects like Bold, Italic, Inversion, double width or height and so on.<br>
-   * Because CanvasClass draws text using glyphs these options affects
+   * Because Canvas draws text using glyphs these options affects
    * also how text is rendered.
    *
    * @param options A bit field to specify multiple options
@@ -550,28 +542,6 @@ public:
   void resetPaintOptions();
 
   /**
-   * @brief Gets the font info that best fits the specified number of columns and rows.
-   *
-   * This method returns only fixed width fonts.
-   *
-   * @param columns Minimum number of required columns.
-   * @param rows Minimum number of required rows.
-   *
-   * @return The font info found.
-   */
-  static FontInfo const * getPresetFontInfo(int columns, int rows);
-
-  /**
-   * @brief Gets the font info that best fits the specified height.
-   *
-   * @param height Required font height in pixels.
-   * @param fixedWidth If True returns only fixed width fonts, if False returns only variable width fonts.
-   *
-   * @return The font info found.
-   */
-  static FontInfo const * getPresetFontInfoFromHeight(int height, bool fixedWidth);
-
-  /**
    * @brief Gets info about currently selected font.
    *
    * @return FontInfo structure representing font info and data.
@@ -586,10 +556,10 @@ public:
    * Examples:
    *
    *     // Set a font for about 40x14 text screen
-   *     Canvas.selectFont(Canvas.getPresetFontInfo(40, 14));
+   *     Canvas.selectFont(fabgl::getPresetFontInfo(Canvas.getWidth(), Canvas.getHeight(), 40, 14));
    *
-   *     // Set the 8x8 predefined font (FONT_8x8 defined in font_8x8.h)
-   *     Canvas.selectFont(&FONT_8x8);
+   *     // Set the 8x8 predefined font
+   *     Canvas.selectFont(&fabgl::FONT_8x8);
    */
   void selectFont(FontInfo const * fontInfo);
 
@@ -640,7 +610,7 @@ public:
    * Example:
    *
    *     // Draw a 'Hello World!' at position 100, 100
-   *     Canvas.drawText(&FONT_8x8, 100, 100, "Hellow World!");
+   *     Canvas.drawText(&fabgl::FONT_8x8, 100, 100, "Hellow World!");
    */
   void drawText(FontInfo const * fontInfo, int X, int Y, char const * text, bool wrap = false);
 
@@ -662,6 +632,13 @@ public:
    * @param text String to calculate length (indexes in the character font glyphs set).
    */
   int textExtent(FontInfo const * fontInfo, char const * text);
+
+  /**
+   * @brief Calculates text extension in pixels.
+   *
+   * @param text String to calculate length (indexes in the character font glyphs set).
+   */
+  int textExtent(char const * text);
 
   /**
    * @brief Draws formatted text at specified position.
@@ -706,19 +683,11 @@ public:
   void drawBitmap(int X, int Y, Bitmap const * bitmap);
 
   /**
-   * @brief Swaps screen buffer when double buffering is enabled.
-   *
-   * Double buffering is enabled calling VGAController.setResolution() with doubleBuffered = true.<br>
-   * Buffers swap is always executed in vertical retracing (at VSync pulse).
-   */
-  void swapBuffers();
-
-  /**
    * @brief Draws a sequence of lines.
    *
    * Because the path is drawn on VSync (vertical retracing) the provided array of points must survive until the path is completely painted.<br>
-   * To avoid it, application can disable drawing on vsync (calling VGAControllerClass.enableBackgroundPrimitiveExecution()) or just wait
-   * until all the drawing have been completed(calling CanvasClass.waitCompletion()).
+   * To avoid it, application can disable drawing on vsync (calling VGAController.enableBackgroundPrimitiveExecution()) or just wait
+   * until all the drawing have been completed(calling Canvas.waitCompletion()).
    *
    * @param points A pointer to an array of Point objects.
    * @param pointsCount Number of points in the array.
@@ -736,8 +705,8 @@ public:
    * @brief Fills the polygon enclosed in a sequence of lines.
    *
    * Because the path is drawn on VSync (vertical retracing) the provided array of points must survive until the path is completely painted.<br>
-   * To avoid it, application can disable drawing on vsync (calling VGAControllerClass.enableBackgroundPrimitiveExecution()) or just wait
-   * until all the drawing have been completed(calling CanvasClass.waitCompletion()).
+   * To avoid it, application can disable drawing on vsync (calling VGAController.enableBackgroundPrimitiveExecution()) or just wait
+   * until all the drawing have been completed(calling Canvas.waitCompletion()).
    *
    * @param points A pointer to an array of Point objects.
    * @param pointsCount Number of points in the array.
@@ -760,17 +729,19 @@ public:
    * @param X Horizontal coordinate.
    * @param Y Vertical coordinate.
    *
-   * @return Pixel color as RGB structure.
+   * @return Pixel color as RGB888 structure.
    */
-  RGB getPixel(int X, int Y);
+  RGB888 getPixel(int X, int Y);
 
 private:
 
-  FontInfo const * m_fontInfo;
-  uint8_t          m_textHorizRate; // specify character size: 1 = m_fontInfo.width, 2 = m_fontInfo.width * 2, etc...
+  DisplayController * m_displayController;
 
-  Point            m_origin;
-  Rect             m_clippingRect;
+  FontInfo const *    m_fontInfo;
+  uint8_t             m_textHorizRate; // specify character size: 1 = m_fontInfo.width, 2 = m_fontInfo.width * 2, etc...
+
+  Point               m_origin;
+  Rect                m_clippingRect;
 };
 
 
@@ -778,7 +749,7 @@ private:
 
 
 
-extern fabgl::CanvasClass Canvas;
+
 
 
 

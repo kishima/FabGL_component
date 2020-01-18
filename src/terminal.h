@@ -27,7 +27,7 @@
 /**
  * @file
  *
- * @brief This file contains fabgl::TerminalClass definition.
+ * @brief This file contains fabgl::Terminal definition.
  */
 
 
@@ -41,7 +41,7 @@
 
 #include "fabglconf.h"
 #include "canvas.h"
-#include "keyboard.h"
+#include "devdrivers/keyboard.h"
 #include "terminfo.h"
 
 #include "Stream.h"
@@ -282,7 +282,7 @@ struct EmuState {
 
   // DECSCLM (Smooth scroll)
   // Smooth scroll is effective only when vertical sync refresh is enabled,
-  // hence must be VGAController.enableBackgroundPrimitiveExecution(true),
+  // hence must be DisplayController.enableBackgroundPrimitiveExecution(true),
   // that is the default.
   bool         smoothScroll;
 
@@ -324,33 +324,34 @@ struct EmuState {
  * like CSI codes (private modes, CUP, TBC, etc..), like CSI-SGR codes (bold, italic, blinking, etc...) and like DCS codes (DECRQSS, etc..).<br>
  * Supports convertion from PS/2 keyboard virtual keys to ANSI or VT codes (keypad, cursor keys, function keys, etc..).<br>
  *
- * TerminalClass can receive codes to display from Serial Port or it can be controlled directly from the application. In the same way
- * TerminalClass can send keyboard codes to a Serial Port or directly to the application.<br>
+ * Terminal can receive codes to display from Serial Port or it can be controlled directly from the application. In the same way
+ * Terminal can send keyboard codes to a Serial Port or directly to the application.<br>
  *
  * For default it supports 80x25 or 132x25 characters at 640x350. However any custom resolution and text buffer size is supported
  * specifying a custom font.<br>
  *
  * There are three cursors styles (block, underlined and bar), blinking or not blinking.
  *
- * TerminalClass inherits from Stream so applications can use all Stream and Print input and output methods.
+ * Terminal inherits from Stream so applications can use all Stream and Print input and output methods.
  *
- * TerminalClass passes 95/110 of VTTEST VT100/VT102 Compatibility Test Score Sheet.
+ * Terminal passes 95/110 of VTTEST VT100/VT102 Compatibility Test Score Sheet.
  *
  *
  *
  * Example 1:
  *
- *     TerminalClass Terminal;
+ *     fabgl::VGAController VGAController;
+ *     fabgl::PS2Controller PS2Controller;
+ *     fabgl::Terminal      Terminal;
  *
  *     // Setup 80x25 columns loop-back terminal (send what you type on keyboard to the display)
  *     void setup() {
- *       Keyboard.begin(GPIO_NUM_33, GPIO_NUM_32);  // GPIOs for keyboard (CLK, DATA)
+ *       PS2Controller.begin(PS2Preset::KeyboardPort0);
  *
- *       // GPIOs for VGA (RED0, RED1, GREEN0, GREEN1, BLUE0, BLUE1, HSYNC, VSYNC)
- *       VGAController.begin(GPIO_NUM_22, GPIO_NUM_21, GPIO_NUM_19, GPIO_NUM_18, GPIO_NUM_5, GPIO_NUM_4, GPIO_NUM_23, GPIO_NUM_15);
- *       VGAController.setResolution(VGA_640x350_70HzAlt1, 640, 350); // 640x350, 80x25 columns
+ *       VGAController.begin();
+ *       VGAController.setResolution(VGA_640x350_70HzAlt1);
  *
- *       Terminal.begin();
+ *       Terminal.begin(&VGAController);
  *       Terminal.connectLocally();      // to use Terminal.read(), available(), etc..
  *       Terminal.enableCursor(true);
  *     }
@@ -375,20 +376,21 @@ struct EmuState {
  *
  * Example 2:
  *
- *     TerminalClass Terminal;
+ *     fabgl::VGAController VGAController;
+ *     fabgl::PS2Controller PS2Controller;
+ *     fabgl::Terminal      Terminal;
  *
  *     // Setup 80x25 columns terminal using UART2 to communicate with the server,
  *     // VGA to display output and PS2 device as keyboard input
  *     void setup() {
  *       Serial2.begin(115200);
  *
- *       Keyboard.begin(GPIO_NUM_33, GPIO_NUM_32); // GPIOs for keyboard (CLK, DATA)
+ *       PS2Controller.begin(PS2Preset::KeyboardPort0);
  *
- *       // GPIOs for VGA (RED0, RED1, GREEN0, GREEN1, BLUE0, BLUE1, HSYNC, VSYNC)
- *       VGAController.begin(GPIO_NUM_22, GPIO_NUM_21, GPIO_NUM_19, GPIO_NUM_18, GPIO_NUM_5, GPIO_NUM_4, GPIO_NUM_23, GPIO_NUM_15);
- *       VGAController.setResolution(VGA_640x350_70HzAlt1, 640, 350); // 640x350, 80x25 columns
+ *       VGAController.begin();
+ *       VGAController.setResolution(VGA_640x350_70HzAlt1);
  *
- *       Terminal.begin();
+ *       Terminal.begin(&VGAController);
  *       Terminal.connectSerialPort(Serial2);
  *       Terminal.enableCursor(true);
  *     }
@@ -397,16 +399,23 @@ struct EmuState {
  *       Terminal.pollSerialPort();
  *     }
  */
-class TerminalClass : public Stream {
+class Terminal : public Stream {
 
 public:
+
+  Terminal();
+
+  ~Terminal();
 
   /**
    * @brief Initializes the terminal.
    *
-   * Applications should call this method before any other method call or after resolution has been set.
+   * Applications should call this method before any other method call and after resolution has been set.
+   *
+   * @param displayController The output display controller
+   * @param keyboard Keyboard device. nullptr = gets from PS2Controller
    */
-  void begin();
+  void begin(DisplayController * displayController, Keyboard * keyboard = nullptr);
 
   /**
    * @brief Finalizes the terminal.
@@ -422,14 +431,14 @@ public:
    * as ANSI/VT100 codes and then sent to the specified serial port.<br>
    * Also replies to terminal queries like terminal identification, cursor position, etc.. will be
    * sent to the serial port.<br>
-   * Call TerminalClass.pollSerialPort() to send codes from serial port to the display.
+   * Call Terminal.pollSerialPort() to send codes from serial port to the display.
    *
    * @param serialPort The serial port to use.
    * @param autoXONXOFF If true uses software flow control (XON/XOFF).
    *
    * Example:
    *
-   *       Terminal.begin();
+   *       Terminal.begin(&VGAController);
    *       Terminal.connectSerialPort(Serial);
    */
   void connectSerialPort(HardwareSerial & serialPort, bool autoXONXOFF = true);
@@ -438,7 +447,7 @@ public:
    * @brief Pools the serial port for incoming data.
    *
    * Tnis method needs to be called in the application main loop to check if new data
-   * is coming from the current serial port (specified using TerminalClass.connectSerialPort).
+   * is coming from the current serial port (specified using Terminal.connectSerialPort).
    *
    * Example:
    *
@@ -457,7 +466,7 @@ public:
    *
    * Example:
    *
-   *        Terminal.begin();
+   *        Terminal.begin(&VGAController);
    *        Terminal.connectLocally();
    *        // from here you can use Terminal.read() to receive keys from keyboard
    *        // and Terminal.write() to control the display.
@@ -492,7 +501,7 @@ public:
    * Example:
    *
    *        Serial.begin(115200);
-   *        Terminal.begin();
+   *        Terminal.begin(&VGAController);
    *        Terminal.setLogStream(Serial);
    */
   void setLogStream(Stream & stream) { m_logStream = &stream; }
@@ -506,7 +515,8 @@ public:
    *
    * Terminal automatically choises the best font considering screen resolution and required
    * number of columns and rows.<br>
-   * Particular cases require setting custom fonts, so applications can use TerminalClass.loadFont().
+   * Particular cases require setting custom fonts, so applications can use Terminal.loadFont().
+   * Only fixed width fonts are supported for terminals.
    *
    * @param font Specifies font info for the font to set.
    */
@@ -623,7 +633,7 @@ public:
   /**
    * @brief Gets the number of codes available in the keyboard queue.
    *
-   * Keyboard queue is available only after TerminalClass.connectLocally() call.
+   * Keyboard queue is available only after Terminal.connectLocally() call.
    *
    * @return The number of codes available to read.
    */
@@ -632,7 +642,7 @@ public:
   /**
    * @brief Reads codes from keyboard.
    *
-   * Keyboard queue is available only after TerminalClass.connectLocally() call.
+   * Keyboard queue is available only after Terminal.connectLocally() call.
    *
    * @return The first code of incoming data available (or -1 if no data is available).
    */
@@ -641,7 +651,7 @@ public:
   /**
    * @brief Reads a code from the keyboard without advancing to the next one.
    *
-   * Keyboard queue is available only after TerminalClass.connectLocally() call.
+   * Keyboard queue is available only after Terminal.connectLocally() call.
    *
    * @return The next code, or -1 if none is available.
    */
@@ -765,8 +775,6 @@ private:
   void refresh();
   void refresh(int X, int Y);
   void refresh(int X1, int Y1, int X2, int Y2);
-  void beginRefresh();
-  void endRefresh();
 
   void setLineDoubleWidth(int row, int value);
   int getCharWidthAt(int row);
@@ -790,6 +798,10 @@ private:
   void convQueue(const char * str = nullptr);
   void TermDecodeVirtualKey(VirtualKey vk);
 
+  DisplayController * m_displayController;
+  Canvas *           m_canvas;
+
+  Keyboard *         m_keyboard;
 
   Stream *           m_logStream;
 

@@ -21,8 +21,14 @@
 
 
 #include <string.h>
+#include <stdlib.h>
+#include <dirent.h>
+#include <unistd.h>
+#include <sys/stat.h>
 
 #include "fabutils.h"
+#include "dispdrivers/vgacontroller.h"
+#include "comdrivers/ps2controller.h"
 
 
 
@@ -104,6 +110,28 @@ void free32(void * ptr)
   heap_caps_free(ptr);
 }
 
+
+
+////////////////////////////////////////////////////////////////////////////////////////////
+// suspendInterrupts
+// resumeInterrupts
+
+void suspendInterrupts()
+{
+  if (VGAController::instance())
+    VGAController::instance()->suspendBackgroundPrimitiveExecution();
+  if (PS2Controller::instance())
+    PS2Controller::instance()->suspend();
+}
+
+
+void resumeInterrupts()
+{
+  if (PS2Controller::instance())
+    PS2Controller::instance()->resume();
+  if (VGAController::instance())
+    VGAController::instance()->resumeBackgroundPrimitiveExecution();
+}
 
 
 ////////////////////////////////////////////////////////////////////////////////////////////
@@ -347,6 +375,258 @@ void StringList::select(int index, bool value)
 // StringList
 ///////////////////////////////////////////////////////////////////////////////////
 
+
+
+///////////////////////////////////////////////////////////////////////////////////
+// FileBrowser
+
+FileBrowser::FileBrowser()
+  : m_dir(nullptr),
+    m_count(0),
+    m_items(nullptr),
+    m_sorted(true),
+    m_includeHiddenFiles(false),
+    m_namesStorage(nullptr)
+{
+}
+
+
+FileBrowser::~FileBrowser()
+{
+  clear();
+}
+
+
+void FileBrowser::clear()
+{
+  free(m_items);
+  m_items = nullptr;
+
+  free(m_namesStorage);
+  m_namesStorage = nullptr;
+
+  m_count = 0;
+}
+
+
+// set absolute directory (full path must be specified)
+void FileBrowser::setDirectory(const char * path)
+{
+  free(m_dir);
+  m_dir = strdup(path);
+  reload();
+}
+
+
+// set relative directory:
+//   ".." : go to the parent directory
+//   "dirname": go inside the specified sub directory
+void FileBrowser::changeDirectory(const char * subdir)
+{
+  if (!m_dir)
+    return;
+  if (strcmp(subdir, "..") == 0) {
+    // go to parent directory
+    auto lastSlash = strrchr(m_dir, '/');
+    if (lastSlash && lastSlash != m_dir) {
+      *lastSlash = 0;
+      reload();
+    }
+  } else {
+    // go to sub directory
+    int oldLen = strlen(m_dir);
+    char * newDir = (char*) malloc(oldLen + 1 + strlen(subdir) + 1);  // m_dir + '/' + subdir + 0
+    strcpy(newDir, m_dir);
+    newDir[oldLen] = '/';
+    strcpy(newDir + oldLen + 1, subdir);
+    free(m_dir);
+    m_dir = newDir;
+    reload();
+  }
+}
+
+
+int FileBrowser::countDirEntries(int * namesLength)
+{
+  int c = 0;
+  *namesLength = 0;
+  if (m_dir) {
+    suspendInterrupts();
+    auto dirp = opendir(m_dir);
+    while (dirp) {
+      auto dp = readdir(dirp);
+      if (dp == NULL)
+        break;
+      if (strcmp(".", dp->d_name) && strcmp("..", dp->d_name) && dp->d_type != DT_UNKNOWN) {
+        *namesLength += strlen(dp->d_name) + 1;
+        ++c;
+      }
+    }
+    closedir(dirp);
+    resumeInterrupts();
+  }
+  return c;
+}
+
+
+bool FileBrowser::exists(char const * name)
+{
+  for (int i = 0; i < m_count; ++i)
+    if (strcmp(name, m_items[i].name) == 0)
+      return true;
+  return false;
+}
+
+
+int DirComp(const void * i1, const void * i2)
+{
+  DirItem * d1 = (DirItem*)i1;
+  DirItem * d2 = (DirItem*)i2;
+  if (d1->isDir != d2->isDir) // directories first
+    return d1->isDir ? -1 : +1;
+  else
+    return strcmp(d1->name, d2->name);
+}
+
+
+void FileBrowser::reload()
+{
+  clear();
+  int namesAlloc;
+  int c = countDirEntries(&namesAlloc);
+  m_items = (DirItem*) malloc(sizeof(DirItem) * (c + 1));
+  m_namesStorage = (char*) malloc(namesAlloc);
+  char * sname = m_namesStorage;
+
+  // first item is always ".."
+  m_items[0].name  = "..";
+  m_items[0].isDir = true;
+  ++m_count;
+
+  suspendInterrupts();
+  auto dirp = opendir(m_dir);
+  for (int i = 0; i < c; ++i) {
+    auto dp = readdir(dirp);
+    if (strcmp(".", dp->d_name) && strcmp("..", dp->d_name) && dp->d_type != DT_UNKNOWN) {
+      DirItem * di = m_items + m_count;
+      // check if this is a simulated directory (like in SPIFFS)
+      auto slashPos = strchr(dp->d_name, '/');
+      if (slashPos) {
+        // yes, this is a simulated dir. Trunc and avoid to insert it twice
+        int len = slashPos - dp->d_name;
+        strncpy(sname, dp->d_name, len);
+        sname[len] = 0;
+        if (!exists(sname)) {
+          di->name  = sname;
+          di->isDir = true;
+          sname += len + 1;
+          ++m_count;
+        }
+      } else if (m_includeHiddenFiles || dp->d_name[0] != '.') {
+        strcpy(sname, dp->d_name);
+        di->name  = sname;
+        di->isDir = (dp->d_type == DT_DIR);
+        sname += strlen(sname) + 1;
+        ++m_count;
+      }
+    }
+  }
+  closedir(dirp);
+  resumeInterrupts();
+  if (m_sorted)
+    qsort(m_items, m_count, sizeof(DirItem), DirComp);
+}
+
+
+// note: for SPIFFS this creates an empty ".dirname" file. The SPIFFS path is detected when path starts with "/spiffs"
+// "dirname" is not a path, just a directory name created inside "m_dir"
+void FileBrowser::makeDirectory(char const * dirname)
+{
+  int dirnameLen = strlen(dirname);
+  if (dirnameLen > 0) {
+    suspendInterrupts();
+    if (strncmp(m_dir, "/spiffs", 7) == 0) {
+      // simulated directory, puts an hidden placeholder
+      char fullpath[strlen(m_dir) + 3 + 2 * dirnameLen + 1];
+      sprintf(fullpath, "%s/%s/.%s", m_dir, dirname, dirname);
+      FILE * f = fopen(fullpath, "wb");
+      fclose(f);
+    } else {
+      char fullpath[strlen(m_dir) + 1 + dirnameLen + 1];
+      sprintf(fullpath, "%s/%s", m_dir, dirname);
+      mkdir(fullpath, ACCESSPERMS);
+    }
+    resumeInterrupts();
+  }
+}
+
+
+// removes a file or a directory (and all files inside it)
+// The SPIFFS path is detected when path starts with "/spiffs"
+// "name" is not a path, just a file or directory name inside "m_dir"
+void FileBrowser::remove(char const * name)
+{
+  suspendInterrupts();
+
+  char fullpath[strlen(m_dir) + 1 + strlen(name) + 1];
+  sprintf(fullpath, "%s/%s", m_dir, name);
+  int r = unlink(fullpath);
+
+  if (r != 0) {
+    // failed
+    if (strncmp(m_dir, "/spiffs", 7) == 0) {
+      // simulated directory
+      // maybe this is a directory, remove ".dir" file
+      char hidpath[strlen(m_dir) + 3 + 2 * strlen(name) + 1];
+      sprintf(hidpath, "%s/%s/.%s", m_dir, name, name);
+      unlink(hidpath);
+      // maybe the directory contains files, remove all
+      auto dirp = opendir(fullpath);
+      while (dirp) {
+        auto dp = readdir(dirp);
+        if (dp == NULL)
+          break;
+        if (strcmp(".", dp->d_name) && strcmp("..", dp->d_name) && dp->d_type != DT_UNKNOWN) {
+          char sfullpath[strlen(fullpath) + 1 + strlen(dp->d_name) + 1];
+          sprintf(sfullpath, "%s/%s", fullpath, dp->d_name);
+          unlink(sfullpath);
+        }
+      }
+      closedir(dirp);
+    }
+  }
+
+  resumeInterrupts();
+}
+
+
+// works only for files
+void FileBrowser::rename(char const * oldName, char const * newName)
+{
+  suspendInterrupts();
+
+  char oldfullpath[strlen(m_dir) + 1 + strlen(oldName) + 1];
+  sprintf(oldfullpath, "%s/%s", m_dir, oldName);
+
+  char newfullpath[strlen(m_dir) + 1 + strlen(newName) + 1];
+  sprintf(newfullpath, "%s/%s", m_dir, newName);
+
+  ::rename(oldfullpath, newfullpath);
+
+  resumeInterrupts();
+}
+
+
+// concatenates current directory and specified name and store result into fullpath
+// Specifying outPath=nullptr returns required length
+int FileBrowser::getFullPath(char const * name, char * outPath, int maxlen)
+{
+  return outPath ? snprintf(outPath, maxlen, "%s/%s", m_dir, name) : snprintf(nullptr, 0, "%s/%s", m_dir, name) + 1;
+}
+
+
+// FileBrowser
+///////////////////////////////////////////////////////////////////////////////////
 
 
 

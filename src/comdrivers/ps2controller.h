@@ -27,7 +27,7 @@
 /**
  * @file
  *
- * @brief This file contains fabgl::PS2ControllerClass definition and the PS2Controller instance.
+ * @brief This file contains fabgl::PS2Controller definition.
  */
 
 
@@ -55,10 +55,13 @@ enum class PS2Preset {
  */
 enum class KbdMode {
   NoVirtualKeys,           /**< No virtual keys are generated */
-  GenerateVirtualKeys,     /**< Virtual keys are generated. You can call KeyboardClass.isVKDown() only. */
-  CreateVirtualKeysQueue,  /**< Virtual keys are generated and put on a queue. You can call KeyboardClass.isVKDown(), KeyboardClass.virtualKeyAvailable() and KeyboardClass.getNextVirtualKey() */
+  GenerateVirtualKeys,     /**< Virtual keys are generated. You can call Keyboard.isVKDown() only. */
+  CreateVirtualKeysQueue,  /**< Virtual keys are generated and put on a queue. You can call Keyboard.isVKDown(), Keyboard.virtualKeyAvailable() and Keyboard.getNextVirtualKey() */
 };
 
+
+class Keyboard;
+class Mouse;
 
 
 /**
@@ -67,9 +70,15 @@ enum class KbdMode {
  * The PS2 controller uses ULP coprocessor and RTC slow memory to communicate with up to two PS2 devices.<br>
  * The ULP coprocessor continuously monitor CLK and DATA lines for incoming data. Optionally can send commands to the PS2 devices.
  */
-class PS2ControllerClass {
+class PS2Controller {
 
 public:
+
+  PS2Controller();
+
+  // unwanted methods
+  PS2Controller(PS2Controller const&)   = delete;
+  void operator=(PS2Controller const&)  = delete;
 
   /**
   * @brief Initializes PS2 device controller.
@@ -148,14 +157,46 @@ public:
    */
   void resume();
 
-private:
+  /**
+   * @brief Returns the instance of Keyboard object automatically created by PS2Controller.
+   *
+   * @return A pointer to a Keyboard object
+   */
+  Keyboard * keyboard() { return m_keyboard; }
+
+  void setKeyboard(Keyboard * value) { m_keyboard = value; }
+
+  /**
+   * @brief Returns the instance of Mouse object automatically created by PS2Controller.
+   *
+   * @return A pointer to a Mouse object
+   */
+  Mouse * mouse() { return m_mouse; }
+
+  void setMouse(Mouse * value) { m_mouse = value; }
+
+  /**
+   * @brief Returns the singleton instance of PS2Controller class
+   *
+   * @return A pointer to PS2Controller singleton object
+   */
+  static PS2Controller * instance() { return s_instance; }
 
   void warmInit();
 
+private:
+
   static void IRAM_ATTR rtc_isr(void * arg);
 
+  static PS2Controller * s_instance;
+
+  // Keyboard and Mouse instances can be created by PS2Controller in one of the begin() calls, or can be
+  // set using setKeyboard() and setMouse() calls.
+  Keyboard *            m_keyboard;
+  Mouse *               m_mouse;
+
   // address of next word to read in the circular buffer
-  int                   m_readPos[2];
+  volatile int          m_readPos[2];
 
   // task that is waiting for TX ends
   volatile TaskHandle_t m_TXWaitTask[2];
@@ -166,7 +207,6 @@ private:
   intr_handle_t         m_isrHandle;
 
   int16_t               m_suspendCount;       // 0 = not suspended, >0 suspended
-  uint16_t              m_suspendPortsState;  // bit 0 = port 0 was enabled, bit 1 = port 1 was enabled
 };
 
 
@@ -177,6 +217,6 @@ private:
 
 
 
-extern fabgl::PS2ControllerClass PS2Controller;
+
 
 
