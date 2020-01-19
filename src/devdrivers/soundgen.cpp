@@ -1,6 +1,6 @@
 /*
   Created by Fabrizio Di Vittorio (fdivitto2013@gmail.com) - <http://www.fabgl.com>
-  Copyright (c) 2019 Fabrizio Di Vittorio.
+  Copyright (c) 2019-2020 Fabrizio Di Vittorio.
   All rights reserved.
 
   This file is part of FabGL Library.
@@ -20,7 +20,7 @@
  */
 
 
-//#include "Arduino.h"    // REMOVE!
+
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/timers.h"
@@ -40,8 +40,8 @@
 namespace fabgl {
 
 
-
-
+// maximum value is I2S_SAMPLE_BUFFER_SIZE
+#define FABGL_SAMPLE_BUFFER_SIZE 32
 
 
 
@@ -88,7 +88,7 @@ void SineWaveformGenerator::setFrequency(int value) {
 
 
 int SineWaveformGenerator::getSample() {
-  if (m_frequency == 0) {
+  if (m_frequency == 0 || duration() == 0) {
     if (m_lastSample > 0)
       --m_lastSample;
     else if (m_lastSample < 0)
@@ -109,6 +109,9 @@ int SineWaveformGenerator::getSample() {
   m_lastSample = sample;
 
   m_phaseAcc = (m_phaseAcc + m_phaseInc) & 0x7ffff;
+
+  decDuration();
+
   return sample;
 }
 
@@ -148,7 +151,7 @@ void SquareWaveformGenerator::setDutyCycle(int dutyCycle)
 
 
 int SquareWaveformGenerator::getSample() {
-  if (m_frequency == 0) {
+  if (m_frequency == 0 || duration() == 0) {
     if (m_lastSample > 0)
       --m_lastSample;
     else if (m_lastSample < 0)
@@ -167,6 +170,9 @@ int SquareWaveformGenerator::getSample() {
   m_lastSample = sample;
 
   m_phaseAcc = (m_phaseAcc + m_phaseInc) & 0x7ffff;
+
+  decDuration();
+
   return sample;
 }
 
@@ -196,7 +202,7 @@ void TriangleWaveformGenerator::setFrequency(int value) {
 
 
 int TriangleWaveformGenerator::getSample() {
-  if (m_frequency == 0) {
+  if (m_frequency == 0 || duration() == 0) {
     if (m_lastSample > 0)
       --m_lastSample;
     else if (m_lastSample < 0)
@@ -215,6 +221,9 @@ int TriangleWaveformGenerator::getSample() {
   m_lastSample = sample;
 
   m_phaseAcc = (m_phaseAcc + m_phaseInc) & 0x7ffff;
+
+  decDuration();
+
   return sample;
 }
 
@@ -245,7 +254,7 @@ void SawtoothWaveformGenerator::setFrequency(int value) {
 
 
 int SawtoothWaveformGenerator::getSample() {
-  if (m_frequency == 0) {
+  if (m_frequency == 0 || duration() == 0) {
     if (m_lastSample > 0)
       --m_lastSample;
     else if (m_lastSample < 0)
@@ -264,6 +273,9 @@ int SawtoothWaveformGenerator::getSample() {
   m_lastSample = sample;
 
   m_phaseAcc = (m_phaseAcc + m_phaseInc) & 0x7ffff;
+
+  decDuration();
+
   return sample;
 }
 
@@ -288,12 +300,18 @@ void NoiseWaveformGenerator::setFrequency(int value)
 
 
 int NoiseWaveformGenerator::getSample() {
+  if (duration() == 0) {
+    return 0;
+  }
+
   // noise generator based on Galois LFSR
   m_noise = (m_noise >> 1) ^ (-(m_noise & 1) & 0xB400u);
   int sample = 127 - (m_noise >> 8);
 
   // process volume
   sample = sample * volume() / 127;
+
+  decDuration();
 
   return sample;
 }
@@ -322,6 +340,11 @@ void SamplesGenerator::setFrequency(int value)
 
 
 int SamplesGenerator::getSample() {
+
+  if (duration() == 0) {
+    return 0;
+  }
+
   int sample = m_data[m_index++];
 
   if (m_index == m_length)
@@ -329,6 +352,8 @@ int SamplesGenerator::getSample() {
 
   // process volume
   sample = sample * volume() / 127;
+
+  decDuration();
 
   return sample;
 }
@@ -381,7 +406,7 @@ void SoundGenerator::i2s_audio_init()
   i2s_config.channel_format       = I2S_CHANNEL_FMT_ONLY_RIGHT;
   i2s_config.intr_alloc_flags     = 0;
   i2s_config.dma_buf_count        = 2;
-  i2s_config.dma_buf_len          = I2S_SAMPLE_BUFFER_SIZE * sizeof(uint16_t);
+  i2s_config.dma_buf_len          = FABGL_SAMPLE_BUFFER_SIZE * sizeof(uint16_t);
   i2s_config.use_apll             = 0;
   i2s_config.tx_desc_auto_clear   = 0;
   i2s_config.intr_alloc_flags     = 0;
@@ -390,17 +415,34 @@ void SoundGenerator::i2s_audio_init()
   // init DAC pad
   i2s_set_dac_mode(I2S_DAC_CHANNEL_RIGHT_EN); // GPIO25
 
-  m_sampleBuffer = (uint16_t*) malloc(I2S_SAMPLE_BUFFER_SIZE * sizeof(uint16_t));
+  m_sampleBuffer = (uint16_t*) malloc(FABGL_SAMPLE_BUFFER_SIZE * sizeof(uint16_t));
 }
 
 
 // the same of suspendPlay, but fill also output DMA with 127s, making output mute (and making "bumping" effect)
 bool SoundGenerator::play(bool value)
 {
-  bool r = suspendPlay(value);
-  if (!value)
-    mutizeOutput();
-  return r;
+  if (playing() != value) {
+    bool r = suspendPlay(value);
+    if (!value)
+      mutizeOutput();
+    return r;
+  } else
+    return value;
+}
+
+
+SamplesGenerator * SoundGenerator::playSamples(int8_t const * data, int length, int volume, int durationMS)
+{
+  auto sgen = new SamplesGenerator(data, length);
+  attach(sgen);
+  sgen->setAutoDestroy(true);
+  if (durationMS > -1)
+    sgen->setDuration(durationMS > 0 ? (m_sampleRate / 1000 * durationMS) : length );
+  sgen->setVolume(volume);
+  sgen->enable(true);
+  play(true);
+  return sgen;
 }
 
 
@@ -453,20 +495,25 @@ void SoundGenerator::detach(WaveformGenerator * value)
 {
   if (!value)
     return;
-
   bool isPlaying = suspendPlay(false);
+  detachNoSuspend(value);
+  suspendPlay(isPlaying);
+}
 
+
+void SoundGenerator::detachNoSuspend(WaveformGenerator * value)
+{
   for (WaveformGenerator * c = m_channels, * prev = nullptr; c; prev = c, c = c->next) {
     if (c == value) {
       if (prev)
         prev->next = c->next;
       else
         m_channels = c->next;
+      if (value->autoDestroy())
+        delete value;
       break;
     }
   }
-
-  suspendPlay(isPlaying);
 }
 
 
@@ -482,13 +529,20 @@ void SoundGenerator::waveGenTask(void * arg)
 
     int mainVolume = soundGenerator->volume();
 
-    for (int i = 0; i < I2S_SAMPLE_BUFFER_SIZE; ++i) {
+    for (int i = 0; i < FABGL_SAMPLE_BUFFER_SIZE; ++i) {
       int sample = 0, tvol = 0;
-      for (auto g = soundGenerator->m_channels; g; g = g->next)
+      for (auto g = soundGenerator->m_channels; g; ) {
         if (g->enabled()) {
           sample += g->getSample();
           tvol += g->volume();
+        } else if (g->duration() == 0 && g->autoDetach()) {
+          auto curr = g;
+          g = g->next;  // setup next item before detaching this one
+          soundGenerator->detachNoSuspend(curr);
+          continue; // bypass "g = g->next;"
         }
+        g = g->next;
+      }
 
       int avol = tvol ? imin(127, 127 * 127 / tvol) : 127;
       sample = sample * avol / 127;
@@ -498,10 +552,14 @@ void SoundGenerator::waveGenTask(void * arg)
     }
 
     size_t bytes_written;
-    i2s_write(I2S_NUM_0, buf, I2S_SAMPLE_BUFFER_SIZE * sizeof(uint16_t), &bytes_written, portMAX_DELAY);
+    i2s_write(I2S_NUM_0, buf, FABGL_SAMPLE_BUFFER_SIZE * sizeof(uint16_t), &bytes_written, portMAX_DELAY);
 
-    // request to suspend?
+    // suspend when there is a notify (from suspendPlay(true)) or when there aren't channels to play
     if (ulTaskNotifyTake(true, 0)) {
+      vTaskSuspend(nullptr);
+    }
+    if (soundGenerator->m_channels == nullptr) {
+      soundGenerator->mutizeOutput();
       vTaskSuspend(nullptr);
     }
 
@@ -511,11 +569,11 @@ void SoundGenerator::waveGenTask(void * arg)
 
 void SoundGenerator::mutizeOutput()
 {
-  for (int i = 0; i < I2S_SAMPLE_BUFFER_SIZE; ++i)
+  for (int i = 0; i < FABGL_SAMPLE_BUFFER_SIZE; ++i)
     m_sampleBuffer[i] = 127 << 8;
   size_t bytes_written;
   for (int i = 0; i < 4; ++i)
-    i2s_write(I2S_NUM_0, m_sampleBuffer, I2S_SAMPLE_BUFFER_SIZE * sizeof(uint16_t), &bytes_written, portMAX_DELAY);
+    i2s_write(I2S_NUM_0, m_sampleBuffer, FABGL_SAMPLE_BUFFER_SIZE * sizeof(uint16_t), &bytes_written, portMAX_DELAY);
 }
 
 
